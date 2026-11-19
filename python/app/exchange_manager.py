@@ -61,6 +61,7 @@ class ExchangeManager:
         return bool(entry.get("apiKey") and entry.get("secret"))
 
     async def acquire(self, exchange_id: str, client: str = "rest") -> ExchangeLease:
+        evicted: ExchangeEntry | None = None
         async with self._lock:
             if self.closed:
                 raise ExchangeManagerError(
@@ -90,8 +91,9 @@ class ExchangeManager:
 
             entry = self.entries.get(exchange_id)
             if entry is None:
+                idle_candidate = None
                 if len(self.entries) >= self.max_instances:
-                    idle = min(
+                    idle_candidate = min(
                         (
                             (key, value)
                             for key, value in self.entries.items()
@@ -100,27 +102,28 @@ class ExchangeManager:
                         key=lambda item: item[1].last_used,
                         default=None,
                     )
-                    if idle is None:
+                    if idle_candidate is None:
                         raise ExchangeManagerError(
                             "Exchange capacity reached", 503, "exchange_capacity_reached"
                         )
-                    self.entries.pop(idle[0])
-                    await self._close_entry(idle[1])
                 rest = rest_cls(dict(options))
                 entry = ExchangeEntry(rest=rest, last_used=time.monotonic())
-                created = True
-            else:
-                created = False
+                if client == "pro":
+                    try:
+                        entry.pro = pro_cls(dict(options))
+                    except Exception:
+                        await entry.rest.close()
+                        raise
+                if idle_candidate is not None:
+                    self.entries.pop(idle_candidate[0])
+                    evicted = idle_candidate[1]
+                    if evicted.idle_task:
+                        evicted.idle_task.cancel()
+                        evicted.idle_task = None
+                self.entries[exchange_id] = entry
 
             if client == "pro" and entry.pro is None:
-                try:
-                    entry.pro = pro_cls(dict(options))
-                except Exception:
-                    if created:
-                        await entry.rest.close()
-                    raise
-            if created:
-                self.entries[exchange_id] = entry
+                entry.pro = pro_cls(dict(options))
             if entry.idle_task:
                 entry.idle_task.cancel()
                 entry.idle_task = None
@@ -141,7 +144,14 @@ class ExchangeManager:
                 if entry.references == 0 and not self.closed:
                     entry.idle_task = asyncio.create_task(self._expire(exchange_id, entry))
 
-        return ExchangeLease(exchange, release)
+        lease = ExchangeLease(exchange, release)
+        if evicted is not None:
+            try:
+                await self._close_entry(evicted)
+            except BaseException:
+                await lease.release()
+                raise
+        return lease
 
     async def with_exchange(self, exchange_id: str, operation: Any, client: str = "rest") -> Any:
         lease = await self.acquire(exchange_id, client)

@@ -218,8 +218,8 @@ def create_app(
             yield
         finally:
             await stream_hub.close()
+            await cache.close()
             await exchange_manager.close()
-            await cache.clear()
             await history_store.close()
 
     history_store = history_store_backend or HistoryStore(config.database_url)

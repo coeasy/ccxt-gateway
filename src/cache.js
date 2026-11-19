@@ -16,20 +16,20 @@ export class AsyncTTLCache {
     if (cached) this.values.delete(key);
     let task = this.inflight.get(key);
     if (!task) {
-      task = Promise.resolve().then(factory);
-      this.inflight.set(key, task);
-      try {
-        const value = await task;
+      task = Promise.resolve().then(factory).then((value) => {
         if (this.inflight.get(key) === task) {
           this.inflight.delete(key);
-          this.values.set(key, { value, expiresAt: this.now() + ttlMs });
-          while (this.values.size > this.maxEntries) this.values.delete(this.values.keys().next().value);
+          if (ttlMs > 0 && this.maxEntries > 0) {
+            this.values.set(key, { value, expiresAt: this.now() + ttlMs });
+            while (this.values.size > this.maxEntries) this.values.delete(this.values.keys().next().value);
+          }
         }
         return value;
-      } catch (error) {
+      }, (error) => {
         if (this.inflight.get(key) === task) this.inflight.delete(key);
         throw error;
-      }
+      });
+      this.inflight.set(key, task);
     }
     return task;
   }

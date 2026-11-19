@@ -9,6 +9,8 @@
 
 Both expose authenticated REST and WebSocket APIs, reuse exchange connections, coalesce identical market-data requests, apply gateway rate limits, and close resources during shutdown. REST schemas are published at `/openapi.json` with Swagger UI at `/docs`; `/metrics` exposes authenticated Prometheus metrics and `/version` reports the running build. Their dependency locks and build instructions are separate. See the [MIT License](LICENSE).
 
+The request paths, resource ownership, and shutdown order are summarized in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Start the Node.js version
 
 ```sh

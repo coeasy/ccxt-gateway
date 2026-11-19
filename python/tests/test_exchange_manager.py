@@ -70,3 +70,33 @@ async def test_manager_evicts_idle_entry_but_rejects_when_all_are_leased(exchang
     assert metrics["closes"] == 1
     await second.release()
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_does_not_hold_its_lock_while_closing_evicted_clients(exchange_modules):
+    rest, pro, _ = exchange_modules
+    manager = ExchangeManager(rest, pro, max_instances=1, idle_ttl=60)
+    first = await manager.acquire("binance")
+    await first.release()
+    close_started = asyncio.Event()
+    finish_close = asyncio.Event()
+    old_rest = manager.entries["binance"].rest
+    original_close = old_rest.close
+
+    async def slow_close():
+        close_started.set()
+        await finish_close.wait()
+        await original_close()
+
+    old_rest.close = slow_close
+    acquiring_replacement = asyncio.create_task(manager.acquire("kraken"))
+    await close_started.wait()
+    try:
+        with pytest.raises(ExchangeManagerError) as error:
+            await asyncio.wait_for(manager.acquire("binance"), timeout=0.1)
+        assert error.value.code == "exchange_capacity_reached"
+    finally:
+        finish_close.set()
+    replacement = await acquiring_replacement
+    await replacement.release()
+    await manager.close()

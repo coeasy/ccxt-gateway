@@ -30,24 +30,27 @@ class AsyncTTLCache:
                 self._values.pop(key, None)
             task = self._inflight.get(key)
             if task is None:
-                task = asyncio.create_task(factory())
+                task = asyncio.create_task(self._produce(key, ttl, factory))
                 self._inflight[key] = task
-                owner = True
-            else:
-                owner = False
+        return await asyncio.shield(task)
+
+    async def _produce(
+        self, key: str, ttl: float, factory: Callable[[], Awaitable[T]]
+    ) -> T:
+        task = asyncio.current_task()
         try:
-            value = await asyncio.shield(task)
+            value = await factory()
         except BaseException:
-            if owner:
-                async with self._lock:
-                    if self._inflight.get(key) is task:
-                        self._inflight.pop(key, None)
-            raise
-        if owner:
             async with self._lock:
                 if self._inflight.get(key) is task:
                     self._inflight.pop(key, None)
-                    self._values[key] = (self.clock() + max(0, ttl), value)
+            raise
+
+        async with self._lock:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
+                if ttl > 0 and self.max_entries > 0:
+                    self._values[key] = (self.clock() + ttl, value)
                     self._values.move_to_end(key)
                     while len(self._values) > self.max_entries:
                         self._values.popitem(last=False)
@@ -56,6 +59,16 @@ class AsyncTTLCache:
     async def clear(self) -> None:
         async with self._lock:
             self._values.clear()
+
+    async def close(self) -> None:
+        async with self._lock:
+            tasks = tuple(self._inflight.values())
+            self._inflight.clear()
+            self._values.clear()
+            for task in tasks:
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @property
     def size(self) -> int:

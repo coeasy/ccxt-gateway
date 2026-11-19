@@ -93,14 +93,14 @@ class MarketStreamHub:
                     pending = asyncio.create_task(self._create_stream(key, options))
                     self.pending[key] = pending
             if stream is None:
-                try:
-                    stream = await pending
-                finally:
-                    async with self._lock:
-                        if self.pending.get(key) is pending and pending.done():
-                            self.pending.pop(key, None)
+                # A disconnecting subscriber must not cancel the shared stream setup task.
+                stream = await asyncio.shield(pending)
             async with self._lock:
-                if stream.stopped or self.closed:
+                if self.closed:
+                    raise ExchangeManagerError(
+                        "WebSocket gateway is shutting down", 503, "gateway_shutting_down"
+                    )
+                if stream.stopped:
                     continue
                 if stream.idle_task:
                     stream.idle_task.cancel()
@@ -147,6 +147,7 @@ class MarketStreamHub:
 
     async def _create_stream(self, key: tuple[Any, ...], options: dict[str, Any]) -> Stream:
         lease = None
+        stream = None
         try:
             lease = await self.manager.acquire(options["exchange"], "pro")
             if options["channel"] in {"fundingRate", "markPrice"}:
@@ -187,6 +188,18 @@ class MarketStreamHub:
             if lease is not None:
                 await lease.release()
             raise
+        finally:
+            async with self._lock:
+                if self.pending.get(key) is asyncio.current_task():
+                    self.pending.pop(key, None)
+                # Setup can finish after its only subscriber disconnects. Retire that
+                # otherwise-orphaned upstream stream after the normal idle grace period.
+                if (
+                    stream is not None
+                    and self.streams.get(key) is stream
+                    and not stream.subscribers
+                ):
+                    self._schedule_idle_stop(stream)
 
     async def _run(self, stream: Stream) -> None:
         method = STREAMS[stream.channel][0]
