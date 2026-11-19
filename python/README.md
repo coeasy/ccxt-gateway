@@ -8,7 +8,7 @@ python -m pip install -r requirements-dev.lock
 python -m uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8080 --workers 1
 ```
 
-Run repeatable checks with `python -m ruff check app tests` and `python -m pytest -m "not integration"`. The opt-in read-only Binance test checks both Async REST and CCXT Pro WebSocket market data:
+Run repeatable checks with `python -m ruff check app tests` and `python -m pytest -m "not integration"`. The opt-in read-only Kraken test checks both Async REST and CCXT Pro WebSocket market data:
 
 ```sh
 RUN_LIVE_INTEGRATION=1 python -m pytest -m integration

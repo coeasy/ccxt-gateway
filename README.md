@@ -28,7 +28,7 @@ python -m pip install -r requirements-dev.lock
 python -m uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8080 --workers 1
 ```
 
-Run `python -m ruff check app tests` and `python -m pytest -m "not integration"` from `python/`. The live test is read-only and checks public Binance REST and WebSocket market data; run it with `RUN_LIVE_INTEGRATION=1 python -m pytest -m integration`.
+Run `python -m ruff check app tests` and `python -m pytest -m "not integration"` from `python/`. The live test is read-only and checks public Kraken REST and WebSocket market data; run it with `RUN_LIVE_INTEGRATION=1 python -m pytest -m integration`.
 
 ## Deployment
 

@@ -22,7 +22,7 @@ Three review passes were performed over the two independently deployable impleme
 ## Round 3 — release and deployment configuration
 
 - Retained the existing Node deployment at the repository root and added a separate Python build context, pinned Python runtime/development requirements, Dockerfile, health check, and MIT license copy.
-- Added one CI workflow for Node 22/24, Python 3.12/3.13, a read-only live Binance REST/WebSocket integration gate, and both Docker builds.
+- Added one CI workflow for Node 22/24, Python 3.12/3.13, a read-only live Kraken REST/WebSocket integration gate, and both Docker builds.
 - Added a tag release job: `v*` GitHub Releases are published only after unit tests, live exchange verification, and both container builds pass.
 - Added a Northflank profile for two separate single-replica services, each with its own build context and Dockerfile. Account-specific service IDs and secrets remain deployment settings.
 - Local automated checks: Node test suite and Python non-live suite. Live exchange, remote GitHub CI, Docker builds, and release publication are reported separately from their actual execution results; the workflow is the required release gate for those remote checks.
