@@ -1,29 +1,37 @@
-# Northflank service profile
+# Northflank deployment profile
 
-This profile targets a Northflank **Combined Service** linked to the `main` branch of `coeasy/ccxt-gateway`.
+Deploy **two separate Combined Services** from this repository so the Python and Node versions can scale, configure, and roll back independently. Both may use the `main` branch; each service points at a different Docker build context and Dockerfile.
 
-## Build
+| Service | Build context | Dockerfile | Container port | Replicas |
+| --- | --- | --- | ---: | ---: |
+| Node.js | `/` | `/Dockerfile` | `8080` | `1` |
+| Python | `/python` | `/Dockerfile` | `8080` | `1` |
 
-- Build type: Dockerfile
-- Build context: `/`
-- Dockerfile: `/Dockerfile`
-- Continuous integration: enabled
-- Continuous delivery: enabled after the first successful build
+For each service, select **Combined Service**, connect `coeasy/ccxt-gateway`, choose **Dockerfile** build, and enable deployment after a successful build. Configure HTTP health probes on `/health/live` and `/health/ready`; allow at least 10 seconds for startup.
 
-## Runtime
+## Runtime secrets and settings
 
-- Container port: `8080` (the application also honors the assigned `PORT` environment variable)
-- Public protocol: HTTP
-- Instances: `1` while WebSocket fan-out is held in process memory
-- Required runtime secret: `API_KEY`
-- Optional runtime secret: `EXCHANGE_CREDENTIALS_JSON`
-- Optional variables: `EXCHANGE_IDLE_TTL_MS`, `EXCHANGE_MAX_INSTANCES`, `EXCHANGE_TIMEOUT_MS`, `WS_IDLE_GRACE_MS`, `WS_MAX_CLIENTS`, `WS_MAX_STREAMS`
+Required for both services:
 
-Do not add exchange keys as build arguments. Configure them as runtime secrets. The gateway API key should be generated in the deployment environment and must not be copied into this repository.
+- `API_KEY`: random secret of at least 32 characters.
+- `PORT`: optional; the platform assigned port is honored, with `8080` as fallback.
+- `EXCHANGE_CREDENTIALS_JSON`: optional JSON object of server-side exchange keys. Only configure it if private balance/order routes are needed. Use keys without withdrawal permissions.
+
+Both implementations support exchange reuse limits (`EXCHANGE_MAX_INSTANCES`, `EXCHANGE_TIMEOUT_MS`), WebSocket client/stream limits (`WS_MAX_CLIENTS`, `WS_MAX_STREAMS`), cache capacity (`CACHE_MAX_ENTRIES`), and gateway rate limits (`RATE_LIMIT_REQUESTS`). Their TTL and rate-window units use different environment names: Node uses `*_MS`; Python uses `*_SECONDS`.
+
+Node cache settings: `CACHE_TICKER_TTL_MS`, `CACHE_ORDERBOOK_TTL_MS`, `CACHE_TRADES_TTL_MS`, `CACHE_OHLCV_TTL_MS`, and `CACHE_MARKETS_TTL_MS`.
+
+Python cache settings: `CACHE_TICKER_TTL_SECONDS`, `CACHE_ORDERBOOK_TTL_SECONDS`, `CACHE_TRADES_TTL_SECONDS`, `CACHE_OHLCV_TTL_SECONDS`, and `CACHE_MARKETS_TTL_SECONDS`.
+
+Node lifecycle settings: `EXCHANGE_IDLE_TTL_MS`, `WS_IDLE_GRACE_MS`, `RATE_LIMIT_WINDOW_MS`.
+
+Python lifecycle settings: `EXCHANGE_IDLE_TTL_SECONDS`, `WS_IDLE_GRACE_SECONDS`, `RATE_LIMIT_WINDOW_SECONDS`.
+
+Set each implementation's variables as runtime secrets/variables. Do not pass secrets as build arguments. The rate limiter and WebSocket fan-out are process-local; start each service with one replica. Horizontal scaling requires shared pub/sub and a shared rate-limit store.
 
 ## Health checks
 
-Configure HTTP probes on the application port:
+Configure these HTTP probes against the service port:
 
 | Probe | Path | Initial delay | Interval | Timeout | Failure threshold |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -31,4 +39,4 @@ Configure HTTP probes on the application port:
 | Liveness | `/health/live` | 10 s | 30 s | 3 s | 3 |
 | Readiness | `/health/ready` | 5 s | 10 s | 3 s | 3 |
 
-Northflank stores service, project, port, and secret settings in the account rather than reading a service manifest from this repository. Configure these values in the service UI or Northflank API after connecting the Git repository. The workflow above follows [Northflank's combined-service deployment flow](https://northflank.com/docs/v1/application/getting-started/build-and-deploy-your-code), [Dockerfile build settings](https://northflank.com/docs/v1/application/build/build-with-a-dockerfile), and [health-check configuration](https://northflank.com/docs/v1/application/observe/configure-health-checks).
+Northflank project/service IDs, custom domains, secrets, and networking belong to the account configuration and are not embedded in this repository.

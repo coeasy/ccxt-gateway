@@ -18,9 +18,9 @@ function validId(value) {
   return typeof value === 'string' && value.length > 0 && value.length <= 128;
 }
 
-export function registerWebSocket(fastify, { hub, apiKey, maxClients = 500 }) {
+export function registerWebSocket(fastify, { hub, apiKey, maxClients = 500, limiter }) {
   let clients = 0;
-  fastify.get('/ws', { websocket: true }, (socket) => {
+  fastify.get('/ws', { websocket: true }, (socket, request) => {
     if (clients >= maxClients) {
       socket.close(1013, 'Server is at capacity');
       return;
@@ -85,6 +85,15 @@ export function registerWebSocket(fastify, { hub, apiKey, maxClients = 500 }) {
         clearTimeout(authTimer);
         send(socket, { type: 'ready' });
         return;
+      }
+
+      if (limiter) {
+        const result = limiter.consume(`ws:${request.ip || request.socket.remoteAddress || 'unknown'}`);
+        if (!result.allowed) {
+          send(socket, { type: 'error', error: 'rate_limit_exceeded', retryAfter: result.retryAfterSeconds });
+          socket.close(1013, 'Message rate limit exceeded');
+          return;
+        }
       }
 
       if (message.op === 'ping') {

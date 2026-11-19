@@ -1,8 +1,10 @@
 import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import { bearerToken, secureTokenEquals } from './auth.js';
+import { AsyncTTLCache } from './cache.js';
 import { ExchangeManager, ExchangeManagerError } from './exchange-manager.js';
 import { MarketStreamHub } from './market-stream-hub.js';
+import { TokenBucketLimiter } from './rate-limit.js';
 import { registerWebSocket } from './websocket.js';
 
 const EXCHANGE_PARAM = { type: 'object', required: ['exchange'], properties: { exchange: { type: 'string', pattern: '^[a-z0-9]+$' } } };
@@ -19,13 +21,15 @@ function routeError(error, reply, request, fastify) {
   return reply.code(502).send({ error: 'exchange_request_failed', message: 'The exchange request failed' });
 }
 
-async function callExchange(exchangeManager, exchangeId, method, args) {
-  return exchangeManager.withExchange(exchangeId, async (exchange) => {
+async function callExchange(exchangeManager, exchangeId, method, args, { cache, ttlMs } = {}) {
+  const execute = () => exchangeManager.withExchange(exchangeId, async (exchange) => {
     if (typeof exchange[method] !== 'function' || exchange.has?.[method] === false) {
       throw new ExchangeManagerError(`Exchange "${exchangeId}" does not support ${method}`, 501, 'method_not_supported');
     }
     return exchange[method](...args);
   });
+  if (!cache || !ttlMs) return execute();
+  return cache.getOrCreate(JSON.stringify([exchangeId, method, args]), ttlMs, execute);
 }
 
 export function buildApp({ config, ccxt, logger = true } = {}) {
@@ -56,10 +60,17 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
     maxStreams: config.wsMaxStreams,
     logger: fastify.log,
   });
+  const cache = new AsyncTTLCache({ maxEntries: config.cacheMaxEntries });
+  const limiter = new TokenBucketLimiter({ capacity: config.rateLimitRequests, windowMs: config.rateLimitWindowMs });
 
   fastify.register(async (websocketScope) => {
     await websocketScope.register(fastifyWebsocket, { options: { maxPayload: 16 * 1024 } });
-    registerWebSocket(websocketScope, { hub: streamHub, apiKey: config.apiKey, maxClients: config.wsMaxClients });
+    registerWebSocket(websocketScope, {
+      hub: streamHub,
+      apiKey: config.apiKey,
+      maxClients: config.wsMaxClients,
+      limiter,
+    });
   });
 
   fastify.get('/health/live', async () => ({ status: 'ok' }));
@@ -72,42 +83,49 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
   };
   fastify.addHook('onRequest', async (request, reply) => {
     const path = request.url.split('?', 1)[0];
-    if (path === '/v1' || path.startsWith('/v1/')) return authenticate(request, reply);
+    if (path === '/v1' || path.startsWith('/v1/')) {
+      const result = limiter.consume(request.ip || request.socket.remoteAddress || 'unknown');
+      if (!result.allowed) {
+        reply.header('retry-after', String(result.retryAfterSeconds));
+        return reply.code(429).send({ error: 'rate_limit_exceeded', message: 'Gateway request limit exceeded' });
+      }
+      return authenticate(request, reply);
+    }
   });
 
   fastify.get('/v1/exchanges', async () => ({ exchanges: exchangeManager.listExchanges() }));
 
   fastify.get('/v1/:exchange/markets', { schema: { params: EXCHANGE_PARAM } }, async (request, reply) => {
     try {
-      const markets = await callExchange(exchangeManager, request.params.exchange, 'loadMarkets', []);
+      const markets = await callExchange(exchangeManager, request.params.exchange, 'loadMarkets', [], { cache, ttlMs: config.cacheMarketsTtlMs });
       return { exchange: request.params.exchange, markets };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
   fastify.get('/v1/:exchange/ticker', { schema: { params: EXCHANGE_PARAM, querystring: SYMBOL_QUERY } }, async (request, reply) => {
     try {
-      const ticker = await callExchange(exchangeManager, request.params.exchange, 'fetchTicker', [request.query.symbol]);
+      const ticker = await callExchange(exchangeManager, request.params.exchange, 'fetchTicker', [request.query.symbol], { cache, ttlMs: config.cacheTickerTtlMs });
       return { exchange: request.params.exchange, symbol: request.query.symbol, ticker };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
   fastify.get('/v1/:exchange/orderbook', { schema: { params: EXCHANGE_PARAM, querystring: LIMIT_QUERY } }, async (request, reply) => {
     try {
-      const orderbook = await callExchange(exchangeManager, request.params.exchange, 'fetchOrderBook', [request.query.symbol, request.query.limit]);
+      const orderbook = await callExchange(exchangeManager, request.params.exchange, 'fetchOrderBook', [request.query.symbol, request.query.limit], { cache, ttlMs: config.cacheOrderbookTtlMs });
       return { exchange: request.params.exchange, symbol: request.query.symbol, orderbook };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
   fastify.get('/v1/:exchange/trades', { schema: { params: EXCHANGE_PARAM, querystring: LIMIT_QUERY } }, async (request, reply) => {
     try {
-      const trades = await callExchange(exchangeManager, request.params.exchange, 'fetchTrades', [request.query.symbol, undefined, request.query.limit]);
+      const trades = await callExchange(exchangeManager, request.params.exchange, 'fetchTrades', [request.query.symbol, undefined, request.query.limit], { cache, ttlMs: config.cacheTradesTtlMs });
       return { exchange: request.params.exchange, symbol: request.query.symbol, trades };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
   fastify.get('/v1/:exchange/ohlcv', { schema: { params: EXCHANGE_PARAM, querystring: OHLCV_QUERY } }, async (request, reply) => {
     try {
-      const candles = await callExchange(exchangeManager, request.params.exchange, 'fetchOHLCV', [request.query.symbol, request.query.timeframe, request.query.since, request.query.limit]);
+      const candles = await callExchange(exchangeManager, request.params.exchange, 'fetchOHLCV', [request.query.symbol, request.query.timeframe, request.query.since, request.query.limit], { cache, ttlMs: config.cacheOhlcvTtlMs });
       return { exchange: request.params.exchange, symbol: request.query.symbol, timeframe: request.query.timeframe, candles };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
@@ -169,6 +187,7 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
   fastify.addHook('onClose', async () => {
     await streamHub.close();
     await exchangeManager.close();
+    cache.clear();
   });
 
   return { fastify, exchangeManager, streamHub };

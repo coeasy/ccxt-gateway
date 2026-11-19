@@ -1,0 +1,1 @@
+"""CCXT gateway application."""

@@ -7,6 +7,14 @@ const DEFAULTS = Object.freeze({
   wsIdleGraceMs: 10_000,
   wsMaxClients: 500,
   wsMaxStreams: 1_000,
+  cacheMaxEntries: 10_000,
+  cacheTickerTtlMs: 2_000,
+  cacheOrderbookTtlMs: 1_000,
+  cacheTradesTtlMs: 1_000,
+  cacheOhlcvTtlMs: 5_000,
+  cacheMarketsTtlMs: 300_000,
+  rateLimitRequests: 120,
+  rateLimitWindowMs: 60_000,
 });
 
 function positiveInteger(value, name, fallback) {
@@ -60,6 +68,14 @@ export function loadConfig(env = process.env) {
     wsIdleGraceMs: positiveInteger(env.WS_IDLE_GRACE_MS, 'WS_IDLE_GRACE_MS', DEFAULTS.wsIdleGraceMs),
     wsMaxClients: positiveInteger(env.WS_MAX_CLIENTS, 'WS_MAX_CLIENTS', DEFAULTS.wsMaxClients),
     wsMaxStreams: positiveInteger(env.WS_MAX_STREAMS, 'WS_MAX_STREAMS', DEFAULTS.wsMaxStreams),
+    cacheMaxEntries: positiveInteger(env.CACHE_MAX_ENTRIES, 'CACHE_MAX_ENTRIES', DEFAULTS.cacheMaxEntries),
+    cacheTickerTtlMs: positiveInteger(env.CACHE_TICKER_TTL_MS, 'CACHE_TICKER_TTL_MS', DEFAULTS.cacheTickerTtlMs),
+    cacheOrderbookTtlMs: positiveInteger(env.CACHE_ORDERBOOK_TTL_MS, 'CACHE_ORDERBOOK_TTL_MS', DEFAULTS.cacheOrderbookTtlMs),
+    cacheTradesTtlMs: positiveInteger(env.CACHE_TRADES_TTL_MS, 'CACHE_TRADES_TTL_MS', DEFAULTS.cacheTradesTtlMs),
+    cacheOhlcvTtlMs: positiveInteger(env.CACHE_OHLCV_TTL_MS, 'CACHE_OHLCV_TTL_MS', DEFAULTS.cacheOhlcvTtlMs),
+    cacheMarketsTtlMs: positiveInteger(env.CACHE_MARKETS_TTL_MS, 'CACHE_MARKETS_TTL_MS', DEFAULTS.cacheMarketsTtlMs),
+    rateLimitRequests: positiveInteger(env.RATE_LIMIT_REQUESTS, 'RATE_LIMIT_REQUESTS', DEFAULTS.rateLimitRequests),
+    rateLimitWindowMs: positiveInteger(env.RATE_LIMIT_WINDOW_MS, 'RATE_LIMIT_WINDOW_MS', DEFAULTS.rateLimitWindowMs),
     nodeEnv: env.NODE_ENV || 'development',
   });
 }

@@ -1,24 +1,28 @@
-# Review record
+# Architecture and security review record
 
-## Round 1 — authentication and secret handling
+Three review passes were performed over the two independently deployable implementations. Findings below were fixed before release candidate preparation.
 
-- Required a gateway key on every REST API route and on the first WebSocket frame; health probes remain public.
-- Added a 32-character minimum and removed the example key value so copying `.env.example` cannot silently enable a known credential.
-- Moved REST authentication to `onRequest` so unauthenticated calls are rejected before query/body validation.
-- Removed raw upstream exception details from HTTP/WebSocket responses and logs. Exchange credentials are read only from runtime configuration; order and balance endpoints fail closed if credentials are absent.
-- Verified invalid HTTP and WebSocket credentials, private-route gating, and limit-order input checks in the automated suite.
-- `npm audit --omit=dev --registry=https://registry.npmjs.org`: 0 vulnerabilities.
+## Round 1 — API boundaries, authentication, and cache scope
 
-## Round 2 — reuse, concurrency, and shutdown
+- Checked gateway credentials, exchange credentials, error handling, and private routes in both implementations. REST requires a bearer token; WebSocket keys travel in the first frame; exchange credentials are accepted only through runtime configuration.
+- Found that the first Python manager draft required a Pro constructor for ordinary REST use. Changed it to create the Async REST client on demand and the Pro client only when a WebSocket stream is requested. An exchange without Pro support can still serve REST.
+- Found that the Python WebSocket adapter initially used CCXT's JavaScript method names. Changed it to CCXT Python's snake-case methods (`watch_ticker`, `watch_order_book`, `watch_trades`, `watch_ohlcv`) and verified those names against the installed CCXT Pro package.
+- Added bounded TTL caches to both implementations for public markets, tickers, books, trades, and candles. Private balances and orders bypass caches.
+- Added per-peer token-bucket limits to REST and WebSocket commands in both implementations. Client, per-client subscription, upstream stream, and outbound queue limits remain bounded.
+- Kept upstream exceptions out of client responses and logs; malformed WebSocket commands return an error frame without discarding a valid connection.
 
-- Added a shared in-flight constructor and reference-counted leases per exchange, idle TTL eviction, an instance cap, and deterministic shutdown.
-- Added a pending-stream map so simultaneous subscribers for the same upstream channel share one watcher. Added per-socket subscription IDs, serialized frame processing, queue/subscription limits, slow-client handling, bounded reconnect backoff, and cleanup after the last subscriber leaves.
-- Corrected the CCXT ESM import after a package compatibility check exposed that `ccxt.default` is not the CCXT module object.
-- Verified concurrent REST leases, idle close, capacity handling, real CCXT Pro constructor availability, duplicate frame handling, shared WebSocket fan-out, bad authentication, and stream caps.
+## Round 2 — concurrency, reuse, and shutdown
 
-## Round 3 — container and deployment readiness
+- Reviewed the exchange lease counter, instance cap, idle expiry, in-flight construction, stream sharing, reconnect backoff, subscriber removal, and shutdown order.
+- Found a Python stream-creation cancellation path that could retain a client lease. Stream creation now releases its lease on every failed or cancelled path.
+- Verified a single Python Pro watch task fans out to multiple local clients, and that REST and Pro clients are reused separately under one exchange entry.
+- Both apps close active streams before closing exchange clients, clear cache state on shutdown, and use one process worker in their deployment commands because their fan-out and limits are in memory.
+- Exchange API secrets are redacted from Node logs; Python logs only exchange IDs and error types. Neither implementation logs authorization values or request bodies.
 
-- Docker uses a production-only dependency install, a non-root runtime user, an explicit health check, and the platform-provided `PORT` when present.
-- CI runs the check suite on Node.js 22 and 24 and builds the Docker image on pushes and pull requests.
-- Added a Northflank service profile with Dockerfile build settings, runtime secret guidance, one-instance WebSocket settings, and HTTP probes.
-- The Docker image could not be built locally because Docker CLI is unavailable in this environment. The GitHub Actions Docker job is the remote build verification. Northflank's account-bound service has not been created; its project, port, and secrets are configured in the Northflank account after linking the repository.
+## Round 3 — release and deployment configuration
+
+- Retained the existing Node deployment at the repository root and added a separate Python build context, pinned Python runtime/development requirements, Dockerfile, health check, and MIT license copy.
+- Added one CI workflow for Node 22/24, Python 3.12/3.13, a read-only live Binance REST/WebSocket integration gate, and both Docker builds.
+- Added a tag release job: `v*` GitHub Releases are published only after unit tests, live exchange verification, and both container builds pass.
+- Added a Northflank profile for two separate single-replica services, each with its own build context and Dockerfile. Account-specific service IDs and secrets remain deployment settings.
+- Local automated checks: Node test suite and Python non-live suite. Live exchange, remote GitHub CI, Docker builds, and release publication are reported separately from their actual execution results; the workflow is the required release gate for those remote checks.

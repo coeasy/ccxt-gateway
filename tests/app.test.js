@@ -29,14 +29,28 @@ test('REST requests share a cached exchange instance and validate request input'
 
   const first = await app.inject({ method: 'GET', url: '/v1/binance/ticker?symbol=BTC%2FUSDT', headers: authorization });
   const second = await app.inject({ method: 'GET', url: '/v1/binance/ticker?symbol=ETH%2FUSDT', headers: authorization });
+  const cached = await app.inject({ method: 'GET', url: '/v1/binance/ticker?symbol=BTC%2FUSDT', headers: authorization });
   const invalid = await app.inject({ method: 'GET', url: '/v1/binance/ticker', headers: authorization });
 
   assert.equal(first.statusCode, 200);
   assert.equal(first.json().ticker.last, 123.45);
   assert.equal(second.statusCode, 200);
+  assert.equal(cached.statusCode, 200);
   assert.equal(metrics.instances, 1);
   assert.equal(metrics.tickerCalls, 2);
   assert.equal(invalid.statusCode, 400);
+});
+
+test('gateway token bucket returns 429 with a retry window after the configured capacity', async (t) => {
+  const { ccxt } = createFakeCcxt();
+  const app = buildApp({ config: testConfig({ rateLimitRequests: 1 }), ccxt, logger: false }).fastify;
+  t.after(() => app.close());
+
+  const first = await app.inject({ method: 'GET', url: '/v1/exchanges', headers: authorization });
+  const second = await app.inject({ method: 'GET', url: '/v1/exchanges', headers: authorization });
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 429);
+  assert.ok(Number(second.headers['retry-after']) >= 1);
 });
 
 test('private methods require configured exchange credentials and reject unsafe limit orders', async (t) => {
