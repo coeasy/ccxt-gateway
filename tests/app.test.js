@@ -96,6 +96,26 @@ test('market filters, historical query parameters, and contract metrics reach CC
   assert.equal(indexCandles.json().candles[0][5], 'index');
 });
 
+test('capability discovery and batch ticker requests expose CCXT support', async (t) => {
+  const { ccxt } = createFakeCcxt();
+  const app = buildApp({ config: testConfig(), ccxt, logger: false }).fastify;
+  t.after(() => app.close());
+
+  const capabilities = await app.inject({
+    method: 'GET', url: '/v1/binance/capabilities', headers: authorization,
+  });
+  const tickers = await app.inject({
+    method: 'GET', url: '/v1/binance/tickers?symbols=BTC%2FUSDT,ETH%2FUSDT', headers: authorization,
+  });
+
+  assert.equal(capabilities.statusCode, 200);
+  assert.deepEqual(capabilities.json().marketTypes, ['contract', 'margin', 'spot', 'swap']);
+  assert.equal(capabilities.json().rest.tickers, 'supported');
+  assert.equal(capabilities.json().websocket.fundingRate, 'supported');
+  assert.equal(tickers.statusCode, 200);
+  assert.equal(Object.keys(tickers.json().tickers).length, 2);
+});
+
 test('gateway token bucket returns 429 with a retry window after the configured capacity', async (t) => {
   const { ccxt } = createFakeCcxt();
   const app = buildApp({ config: testConfig({ rateLimitRequests: 1 }), ccxt, logger: false }).fastify;

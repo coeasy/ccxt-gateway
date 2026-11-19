@@ -7,6 +7,7 @@ export function createFakeCcxt({ watchDelayMs = 5 } = {}) {
       this.has = {
         loadMarkets: true,
         fetchTicker: true,
+        fetchTickers: true,
         fetchOrderBook: true,
         fetchTrades: true,
         fetchOHLCV: true,
@@ -34,6 +35,9 @@ export function createFakeCcxt({ watchDelayMs = 5 } = {}) {
     async fetchTicker(symbol) {
       metrics.tickerCalls += 1;
       return { symbol, last: 123.45 };
+    }
+    async fetchTickers(symbols) {
+      return Object.fromEntries(symbols.map((symbol) => [symbol, { symbol, last: 123.45 }]));
     }
     async fetchOrderBook(symbol, limit) { return { symbol, limit: limit ?? 20, bids: [], asks: [] }; }
     async fetchTrades(symbol, since, limit, params) { return [{ symbol, since: since ?? null, limit: limit ?? 100, paginate: params?.paginate ?? false, paginationCalls: params?.paginationCalls ?? null, paginationDirection: params?.paginationDirection ?? null }]; }

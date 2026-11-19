@@ -45,8 +45,10 @@ Both services provide the same route shape. Send `Authorization: Bearer <API_KEY
 | `GET` | `/health/live` | Liveness probe |
 | `GET` | `/health/ready` | Readiness probe |
 | `GET` | `/v1/exchanges` | Supported CCXT exchange IDs |
+| `GET` | `/v1/{exchange}/capabilities` | Product types, timeframes, REST method status, and WebSocket channel status |
 | `GET` | `/v1/{exchange}/markets?type=spot&base=BTC&quote=USDT` | Filter exchange markets by product type and currencies (`spot`, `margin`, `swap`, `future`, `option`, `contract`) |
 | `GET` | `/v1/{exchange}/ticker?symbol=BTC%2FUSDT` | Ticker |
+| `GET` | `/v1/{exchange}/tickers?symbols=BTC%2FUSDT,ETH%2FUSDT` | Batch tickers for up to 50 symbols when the exchange supports it |
 | `GET` | `/v1/{exchange}/orderbook?symbol=BTC%2FUSDT&limit=20` | Order book |
 | `GET` | `/v1/{exchange}/trades?symbol=BTC%2FUSDT&since=1700000000000&limit=100&paginate=true&paginationCalls=5` | Trades from a UTC millisecond timestamp; optional bounded CCXT pagination |
 | `GET` | `/v1/{exchange}/ohlcv?symbol=BTC%2FUSDT%3AUSDT&timeframe=1h&price=mark&since=1700000000000&paginate=true&paginationCalls=5` | OHLCV candles for last, mark, index, or premium index prices |
@@ -63,6 +65,8 @@ Both services provide the same route shape. Send `Authorization: Bearer <API_KEY
 WebSocket clients connect to `/ws`, authenticate with `{"op":"auth","token":"<API_KEY>"}`, then subscribe with `{"op":"subscribe","id":"btc","exchange":"binance","channel":"ticker","symbol":"BTC/USDT"}`. Supported channels are `ticker`, `orderbook`, `trades`, `ohlcv`, `fundingRate`, and `markPrice`. Contract pairs use CCXT's unified contract symbol when required, such as `BTC/USDT:USDT`; discover available pairs with `/markets?type=swap` or `/markets?type=future`.
 
 Historical endpoints pass the requested timestamp and limit to the exchange. Add `paginate=true` to supported history routes to enable CCXT pagination, with `paginationCalls` capped at 5; CCXT documents this facility as experimental and exchange-dependent. The gateway does not archive upstream data, and exchanges set their own retention windows, page sizes, and supported market types. A unified symbol selects the exact market; availability of spot, margin, swap, dated futures, options, and each data method varies by exchange. Contract-only endpoints return a not-supported error when that exchange does not implement the underlying CCXT method.
+
+The capabilities response reports each method as `supported`, `emulated`, or `unsupported`, based on the installed CCXT exchange implementation. Use it before invoking optional methods such as batch tickers or contract metrics.
 
 ## Resource and scaling model
 

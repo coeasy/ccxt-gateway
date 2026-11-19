@@ -17,6 +17,7 @@ class FakeExchange:
             for name in (
                 "loadMarkets",
                 "fetchTicker",
+                "fetchTickers",
                 "fetchOrderBook",
                 "fetchTrades",
                 "fetchOHLCV",
@@ -56,6 +57,9 @@ class FakeExchange:
     async def fetch_ticker(self, symbol):
         self.metrics["ticker_calls"] += 1
         return {"symbol": symbol, "last": 42.5}
+
+    async def fetch_tickers(self, symbols):
+        return {symbol: {"symbol": symbol, "last": 42.5} for symbol in symbols}
 
     async def fetch_order_book(self, symbol, limit=20):
         return {"symbol": symbol, "limit": limit, "bids": [], "asks": []}

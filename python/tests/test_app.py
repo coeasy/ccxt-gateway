@@ -147,6 +147,26 @@ def test_market_filters_history_and_contract_metrics(exchange_modules, gateway_c
     assert index_candles.json()["candles"][0][9] == "index"
 
 
+def test_capability_discovery_and_batch_ticker_requests(exchange_modules, gateway_config):
+    rest, pro, _ = exchange_modules
+    app = create_app(gateway_config, rest, pro)
+    auth = headers(gateway_config)
+    with TestClient(app) as client:
+        capabilities = client.get("/v1/binance/capabilities", headers=auth)
+        tickers = client.get(
+            "/v1/binance/tickers",
+            params={"symbols": "BTC/USDT,ETH/USDT"},
+            headers=auth,
+        )
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["marketTypes"] == ["contract", "margin", "spot", "swap"]
+    assert capabilities.json()["rest"]["tickers"] == "supported"
+    assert capabilities.json()["websocket"]["fundingRate"] == "supported"
+    assert tickers.status_code == 200
+    assert len(tickers.json()["tickers"]) == 2
+
+
 def test_websocket_uses_one_upstream_subscription_for_clients(exchange_modules, gateway_config):
     rest, pro, metrics = exchange_modules
     app = create_app(gateway_config, rest, pro)

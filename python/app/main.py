@@ -21,6 +21,7 @@ logger = logging.getLogger("ccxt_gateway")
 CAPABILITIES = {
     "load_markets": "loadMarkets",
     "fetch_ticker": "fetchTicker",
+    "fetch_tickers": "fetchTickers",
     "fetch_order_book": "fetchOrderBook",
     "fetch_trades": "fetchTrades",
     "fetch_ohlcv": "fetchOHLCV",
@@ -33,6 +34,72 @@ CAPABILITIES = {
     "create_order": "createOrder",
     "cancel_order": "cancelOrder",
 }
+REST_METHODS = {
+    "markets": "load_markets",
+    "ticker": "fetch_ticker",
+    "tickers": "fetch_tickers",
+    "orderbook": "fetch_order_book",
+    "trades": "fetch_trades",
+    "ohlcv": "fetch_ohlcv",
+    "fundingRate": "fetch_funding_rate",
+    "fundingRateHistory": "fetch_funding_rate_history",
+    "openInterest": "fetch_open_interest",
+    "openInterestHistory": "fetch_open_interest_history",
+    "markPrice": "fetch_mark_price",
+    "balance": "fetch_balance",
+    "createOrder": "create_order",
+    "cancelOrder": "cancel_order",
+}
+WEBSOCKET_METHODS = {
+    "ticker": ("watch_ticker", "watchTicker"),
+    "orderbook": ("watch_order_book", "watchOrderBook"),
+    "trades": ("watch_trades", "watchTrades"),
+    "ohlcv": ("watch_ohlcv", "watchOHLCV"),
+    "fundingRate": ("watch_funding_rate", "watchFundingRate"),
+    "markPrice": ("watch_mark_price", "watchMarkPrice"),
+}
+
+
+def _method_status(exchange: Any, method: str) -> str:
+    if not callable(getattr(exchange, method, None)):
+        return "unsupported"
+    capability = getattr(exchange, "has", {}).get(CAPABILITIES.get(method, method))
+    if capability is True:
+        return "supported"
+    return "emulated" if capability == "emulated" else "unsupported"
+
+
+def _websocket_status(exchange: Any, method: str, capability: str) -> str:
+    return (
+        "supported"
+        if callable(getattr(exchange, method, None))
+        and getattr(exchange, "has", {}).get(capability) is True
+        else "unsupported"
+    )
+
+
+def _parse_symbols(value: str) -> list[str]:
+    symbols = list(dict.fromkeys(symbol.strip() for symbol in value.split(",")))
+    invalid = not symbols or len(symbols) > 50 or any(
+        not symbol or len(symbol) > 64 for symbol in symbols
+    )
+    if invalid:
+        raise ExchangeManagerError("Provide between 1 and 50 valid symbols", 400, "invalid_symbols")
+    return symbols
+
+
+def _market_types(markets: dict[str, Any]) -> list[str]:
+    values = [market for market in markets.values() if isinstance(market, dict)]
+    types = {market["type"] for market in values if market.get("type")}
+    if any(market.get("margin") is True for market in values):
+        types.add("margin")
+    if any(
+        market.get("contract") is True
+        or market.get("type") in {"swap", "future", "option"}
+        for market in values
+    ):
+        types.add("contract")
+    return sorted(types)
 
 
 def _filter_markets(
@@ -227,6 +294,40 @@ def create_app(
         except Exception as exc:
             _raise_exchange_error(exchange, exc)
 
+    @router.get("/{exchange}/capabilities")
+    async def capabilities(exchange: str) -> dict[str, Any]:
+        rest_lease = None
+        pro_lease = None
+        try:
+            rest_lease = await exchange_manager.acquire(exchange, "rest")
+            pro_lease = await exchange_manager.acquire(exchange, "pro")
+            rest_exchange = rest_lease.exchange
+            pro_exchange = pro_lease.exchange
+            markets = await rest_exchange.load_markets()
+            return {
+                "exchange": exchange,
+                "marketCount": len(markets),
+                "marketTypes": _market_types(markets),
+                "timeframes": sorted((getattr(rest_exchange, "timeframes", None) or {}).keys()),
+                "rest": {
+                    name: _method_status(rest_exchange, method)
+                    for name, method in REST_METHODS.items()
+                },
+                "websocket": {
+                    name: _websocket_status(pro_exchange, method, capability)
+                    for name, (method, capability) in WEBSOCKET_METHODS.items()
+                },
+            }
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+        finally:
+            if pro_lease is not None:
+                await pro_lease.release()
+            if rest_lease is not None:
+                await rest_lease.release()
+
     @router.get("/{exchange}/ticker")
     async def ticker(
         exchange: str, symbol: str = Query(min_length=1, max_length=64)
@@ -239,6 +340,24 @@ def create_app(
                     exchange, "fetch_ticker", (symbol,), config.cache_ticker_ttl
                 ),
             }
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/tickers")
+    async def tickers(
+        exchange: str, symbols: str = Query(min_length=3, max_length=3249)
+    ) -> dict[str, Any]:
+        try:
+            requested = _parse_symbols(symbols)
+            value = await call_exchange(
+                exchange,
+                "fetch_tickers",
+                (requested,),
+                config.cache_ticker_ttl,
+            )
+            return {"exchange": exchange, "symbols": requested, "tickers": value}
         except ExchangeManagerError:
             raise
         except Exception as exc:
