@@ -1,23 +1,36 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.cache import AsyncTTLCache
 from app.config import GatewayConfig
 from app.exchange_manager import ExchangeManager, ExchangeManagerError
+from app.history_store import HistoryStore
+from app.idempotency import (
+    IdempotencyCapacityError,
+    IdempotencyConflictError,
+    IdempotencyStore,
+)
 from app.market_stream_hub import MarketStreamHub
+from app.metrics import RequestMetrics
 from app.rate_limit import TokenBucketLimiter
 from app.websocket import serve_websocket
 
 logger = logging.getLogger("ccxt_gateway")
+bearer_scheme = HTTPBearer(auto_error=False)
 CAPABILITIES = {
     "load_markets": "loadMarkets",
     "fetch_ticker": "fetchTicker",
@@ -33,6 +46,12 @@ CAPABILITIES = {
     "fetch_balance": "fetchBalance",
     "create_order": "createOrder",
     "cancel_order": "cancelOrder",
+    "fetch_open_orders": "fetchOpenOrders",
+    "fetch_order": "fetchOrder",
+    "fetch_orders": "fetchOrders",
+    "fetch_my_trades": "fetchMyTrades",
+    "fetch_positions": "fetchPositions",
+    "fetch_trading_fee": "fetchTradingFee",
 }
 REST_METHODS = {
     "markets": "load_markets",
@@ -49,6 +68,12 @@ REST_METHODS = {
     "balance": "fetch_balance",
     "createOrder": "create_order",
     "cancelOrder": "cancel_order",
+    "openOrders": "fetch_open_orders",
+    "order": "fetch_order",
+    "orders": "fetch_orders",
+    "myTrades": "fetch_my_trades",
+    "positions": "fetch_positions",
+    "tradingFee": "fetch_trading_fee",
 }
 WEBSOCKET_METHODS = {
     "ticker": ("watch_ticker", "watchTicker"),
@@ -80,8 +105,10 @@ def _websocket_status(exchange: Any, method: str, capability: str) -> str:
 
 def _parse_symbols(value: str) -> list[str]:
     symbols = list(dict.fromkeys(symbol.strip() for symbol in value.split(",")))
-    invalid = not symbols or len(symbols) > 50 or any(
-        not symbol or len(symbol) > 64 for symbol in symbols
+    invalid = (
+        not symbols
+        or len(symbols) > 50
+        or any(not symbol or len(symbol) > 64 for symbol in symbols)
     )
     if invalid:
         raise ExchangeManagerError("Provide between 1 and 50 valid symbols", 400, "invalid_symbols")
@@ -94,8 +121,7 @@ def _market_types(markets: dict[str, Any]) -> list[str]:
     if any(market.get("margin") is True for market in values):
         types.add("margin")
     if any(
-        market.get("contract") is True
-        or market.get("type") in {"swap", "future", "option"}
+        market.get("contract") is True or market.get("type") in {"swap", "future", "option"}
         for market in values
     ):
         types.add("contract")
@@ -165,6 +191,7 @@ def create_app(
     config: GatewayConfig | None = None,
     async_ccxt: Any | None = None,
     pro_ccxt: Any | None = None,
+    history_store_backend: Any | None = None,
 ) -> FastAPI:
     config = config or GatewayConfig.from_env()
     if async_ccxt is None or pro_ccxt is None:
@@ -187,41 +214,67 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
+            await history_store.initialize()
             yield
         finally:
             await stream_hub.close()
             await exchange_manager.close()
             await cache.clear()
+            await history_store.close()
+
+    history_store = history_store_backend or HistoryStore(config.database_url)
+    metrics = RequestMetrics()
+    idempotency = IdempotencyStore()
 
     app = FastAPI(
         title="CCXT Gateway",
         version="0.1.0",
+        description=(
+            "Unified CCXT REST and WebSocket gateway. REST APIs use bearer authentication; "
+            "WebSockets authenticate in their first message."
+        ),
         lifespan=lifespan,
-        docs_url=None,
+        docs_url="/docs",
         redoc_url=None,
-        openapi_url=None,
+        openapi_url="/openapi.json",
     )
     app.state.exchange_manager = exchange_manager
     app.state.stream_hub = stream_hub
     app.state.cache = cache
     app.state.ws_clients = set()
+    app.state.metrics = metrics
+    app.state.history_store = history_store
 
     @app.middleware("http")
     async def gateway_rate_limit(request: Request, call_next: Any):
+        started = time.perf_counter()
+        request.state.request_id = uuid.uuid4().hex
         path = request.url.path
+        response = None
         if path.startswith("/v1/"):
             client = request.client.host if request.client else "unknown"
             allowed, retry_after = limiter.consume(client)
             if not allowed:
-                return JSONResponse(
+                response = JSONResponse(
                     {"error": "rate_limit_exceeded", "message": "Gateway request limit exceeded"},
                     status_code=429,
                     headers={"Retry-After": str(retry_after)},
                 )
-        return await call_next(request)
+        if response is None:
+            response = await call_next(request)
+        route = getattr(request.scope.get("route"), "path", "/unmatched")
+        metrics.observe(request.method, route, response.status_code, time.perf_counter() - started)
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
 
-    async def authenticate(authorization: str | None = Header(default=None)) -> None:
-        token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    async def authenticate(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+    ) -> None:
+        token = (
+            credentials.credentials
+            if credentials and credentials.scheme.lower() == "bearer"
+            else ""
+        )
         if not hmac.compare_digest(token.encode(), config.api_key.encode()):
             raise HTTPException(
                 status_code=401,
@@ -229,6 +282,17 @@ def create_app(
             )
 
     router = APIRouter(prefix="/v1", dependencies=[Depends(authenticate)])
+
+    @app.get("/version")
+    async def version() -> dict[str, str]:
+        return {"version": "0.1.0", "commit": config.git_sha}
+
+    @app.get("/metrics", dependencies=[Depends(authenticate)])
+    async def prometheus_metrics() -> Any:
+        return Response(
+            metrics.render(cache.size, len(exchange_manager.entries), len(stream_hub.streams)),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     async def call_exchange(
         exchange_id: str,
@@ -249,23 +313,28 @@ def create_app(
                     )
             capability = getattr(exchange, "has", {})
             supported = capability.get(CAPABILITIES.get(method, method))
-            if (
-                not (supported is True or supported == "emulated")
-                or not callable(getattr(exchange, method, None))
+            if not (supported is True or supported == "emulated") or not callable(
+                getattr(exchange, method, None)
             ):
                 raise ExchangeManagerError(
                     f"Exchange does not support {method}", 501, "method_not_supported"
                 )
             return await getattr(exchange, method)(*args)
 
-        if ttl is None:
-            return await exchange_manager.with_exchange(exchange_id, operation)
-        key = json.dumps(
-            [exchange_id, method, args, market_type], separators=(",", ":"), sort_keys=True
-        )
-        return await cache.get_or_create(
-            key, ttl, lambda: exchange_manager.with_exchange(exchange_id, operation)
-        )
+        try:
+            if ttl is None:
+                return await exchange_manager.with_exchange(exchange_id, operation)
+            key = json.dumps(
+                [exchange_id, method, args, market_type], separators=(",", ":"), sort_keys=True
+            )
+            return await cache.get_or_create(
+                key, ttl, lambda: exchange_manager.with_exchange(exchange_id, operation)
+            )
+        except ExchangeManagerError:
+            raise
+        except Exception:
+            metrics.exchange_errors += 1
+            raise
 
     @router.get("/exchanges")
     async def exchanges() -> dict[str, list[str]]:
@@ -281,9 +350,7 @@ def create_app(
         quote: str | None = Query(default=None, min_length=1, max_length=16),
     ) -> dict[str, Any]:
         try:
-            loaded = await call_exchange(
-                exchange, "load_markets", (), config.cache_markets_ttl
-            )
+            loaded = await call_exchange(exchange, "load_markets", (), config.cache_markets_ttl)
             return {
                 "exchange": exchange,
                 "filters": {"type": market_type, "base": base, "quote": quote},
@@ -379,6 +446,97 @@ def create_app(
         except Exception as exc:
             _raise_exchange_error(exchange, exc)
 
+    @router.get("/archive/ohlcv")
+    async def archived_ohlcv(
+        exchange: str = Query(min_length=1, max_length=64, pattern="^[a-z0-9]+$"),
+        symbol: str = Query(min_length=1, max_length=64),
+        timeframe: str = Query(min_length=1, max_length=16),
+        price: str = Query(default="last", pattern="^(last|mark|index|premiumIndex)$"),
+        since: int | None = Query(default=None, ge=0),
+        until: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=1000, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        if since is not None and until is not None and until < since:
+            raise HTTPException(
+                400,
+                detail={
+                    "error": "invalid_time_range",
+                    "message": "until must be greater than or equal to since",
+                },
+            )
+        try:
+            rows = await history_store.query(
+                "ohlcv", exchange, symbol, f"{timeframe}:{price}", since, until, limit
+            )
+            if rows is None:
+                raise HTTPException(
+                    503,
+                    detail={
+                        "error": "storage_not_configured",
+                        "message": "Set DATABASE_URL to enable archived market data",
+                    },
+                )
+            return {
+                "source": "archive",
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "price": price,
+                "candles": rows,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            metrics.storage_errors += 1
+            logger.exception("Historical candle query failed")
+            raise HTTPException(
+                503,
+                detail={
+                    "error": "storage_unavailable",
+                    "message": "Historical storage is temporarily unavailable",
+                },
+            ) from exc
+
+    @router.get("/archive/trades")
+    async def archived_trades(
+        exchange: str = Query(min_length=1, max_length=64, pattern="^[a-z0-9]+$"),
+        symbol: str = Query(min_length=1, max_length=64),
+        since: int | None = Query(default=None, ge=0),
+        until: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=1000, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        if since is not None and until is not None and until < since:
+            raise HTTPException(
+                400,
+                detail={
+                    "error": "invalid_time_range",
+                    "message": "until must be greater than or equal to since",
+                },
+            )
+        try:
+            rows = await history_store.query("trades", exchange, symbol, "", since, until, limit)
+            if rows is None:
+                raise HTTPException(
+                    503,
+                    detail={
+                        "error": "storage_not_configured",
+                        "message": "Set DATABASE_URL to enable archived market data",
+                    },
+                )
+            return {"source": "archive", "exchange": exchange, "symbol": symbol, "trades": rows}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            metrics.storage_errors += 1
+            logger.exception("Historical trade query failed")
+            raise HTTPException(
+                503,
+                detail={
+                    "error": "storage_unavailable",
+                    "message": "Historical storage is temporarily unavailable",
+                },
+            ) from exc
+
     @router.get("/{exchange}/trades")
     async def trades(
         exchange: str,
@@ -400,6 +558,11 @@ def create_app(
                 ),
                 config.cache_trades_ttl,
             )
+            try:
+                await history_store.save_trades(exchange, symbol, value)
+            except Exception:
+                metrics.storage_errors += 1
+                logger.exception("Failed to archive exchange trades")
             return {"exchange": exchange, "symbol": symbol, "trades": value}
         except ExchangeManagerError:
             raise
@@ -434,6 +597,13 @@ def create_app(
                 config.cache_ohlcv_ttl,
                 market_type="contract" if price else None,
             )
+            try:
+                await history_store.save_candles(
+                    exchange, symbol, timeframe, value, price or "last"
+                )
+            except Exception:
+                metrics.storage_errors += 1
+                logger.exception("Failed to archive exchange candles")
             return {
                 "exchange": exchange,
                 "symbol": symbol,
@@ -615,8 +785,9 @@ def create_app(
         except Exception as exc:
             _raise_exchange_error(exchange, exc)
 
-    @router.post("/{exchange}/order", status_code=201)
-    async def create_order(exchange: str, body: OrderRequest) -> dict[str, Any]:
+    async def private_call(
+        exchange: str, method: str, args: tuple[Any, ...], response_key: str
+    ) -> dict[str, Any]:
         if not exchange_manager.has_credentials(exchange):
             raise HTTPException(
                 403,
@@ -625,18 +796,151 @@ def create_app(
                     "message": "No exchange credentials are configured",
                 },
             )
+        try:
+            return {"exchange": exchange, response_key: await call_exchange(exchange, method, args)}
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/open-orders")
+    async def open_orders(
+        exchange: str, symbol: str | None = Query(default=None, min_length=1, max_length=64)
+    ) -> dict[str, Any]:
+        return await private_call(exchange, "fetch_open_orders", (symbol,), "orders")
+
+    @router.get("/{exchange}/order/{order_id}")
+    async def fetch_order(
+        exchange: str, order_id: str, symbol: str = Query(min_length=1, max_length=64)
+    ) -> dict[str, Any]:
+        if len(order_id) > 128:
+            raise HTTPException(
+                400, detail={"error": "invalid_order_id", "message": "Order ID is too long"}
+            )
+        return await private_call(exchange, "fetch_order", (order_id, symbol), "order")
+
+    @router.get("/{exchange}/orders/history")
+    async def order_history(
+        exchange: str,
+        symbol: str = Query(min_length=1, max_length=64),
+        since: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        return await private_call(exchange, "fetch_orders", (symbol, since, limit), "orders")
+
+    @router.get("/{exchange}/my-trades")
+    async def my_trades(
+        exchange: str,
+        symbol: str = Query(min_length=1, max_length=64),
+        since: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        return await private_call(exchange, "fetch_my_trades", (symbol, since, limit), "trades")
+
+    @router.get("/{exchange}/positions")
+    async def positions(
+        exchange: str, symbols: str | None = Query(default=None, min_length=1, max_length=3249)
+    ) -> dict[str, Any]:
+        parsed = _parse_symbols(symbols) if symbols else None
+        return await private_call(exchange, "fetch_positions", (parsed,), "positions")
+
+    @router.get("/{exchange}/trading-fee")
+    async def trading_fee(
+        exchange: str, symbol: str = Query(min_length=1, max_length=64)
+    ) -> dict[str, Any]:
+        return await private_call(exchange, "fetch_trading_fee", (symbol,), "fee")
+
+    @router.post("/{exchange}/order", status_code=201)
+    async def create_order(
+        exchange: str,
+        request: Request,
+        body: OrderRequest,
+        idempotency_key: str = Header(
+            alias="Idempotency-Key", min_length=8, max_length=128, pattern="^[A-Za-z0-9._:-]+$"
+        ),
+    ) -> dict[str, Any]:
+        if not exchange_manager.has_credentials(exchange):
+            raise HTTPException(
+                403,
+                detail={
+                    "error": "credentials_not_configured",
+                    "message": "No exchange credentials are configured",
+                },
+            )
+        if not config.trading_enabled:
+            raise HTTPException(
+                403,
+                detail={
+                    "error": "trading_disabled",
+                    "message": "Set TRADING_ENABLED=true to enable order submission",
+                },
+            )
+        if body.type == "market" and not config.market_orders_enabled:
+            raise HTTPException(
+                403,
+                detail={
+                    "error": "market_orders_disabled",
+                    "message": "Set MARKET_ORDERS_ENABLED=true to enable market orders",
+                },
+            )
         if body.type == "limit" and body.price is None:
             raise HTTPException(
                 400, detail={"error": "price_required", "message": "Limit orders require a price"}
             )
         try:
-            result = await call_exchange(
-                exchange,
-                "create_order",
-                (body.symbol, body.type, body.side, body.amount, body.price, body.params),
+            payload = body.model_dump(mode="json")
+
+            async def submit_and_audit() -> Any:
+                result = await call_exchange(
+                    exchange,
+                    "create_order",
+                    (body.symbol, body.type, body.side, body.amount, body.price, body.params),
+                )
+                key_hash = IdempotencyStore.fingerprint(idempotency_key)
+                audit_payload = {
+                    "symbol": body.symbol,
+                    "type": body.type,
+                    "side": body.side,
+                    "amount": body.amount,
+                    "price": body.price,
+                    "requestId": getattr(request.state, "request_id", "unknown"),
+                }
+                logger.info(
+                    "order.created exchange=%s order_id=%s idempotency_hash=%s request_id=%s "
+                    "symbol=%s side=%s type=%s amount=%s",
+                    exchange,
+                    result.get("id") if isinstance(result, dict) else None,
+                    key_hash,
+                    audit_payload["requestId"],
+                    body.symbol,
+                    body.side,
+                    body.type,
+                    body.amount,
+                )
+                try:
+                    await history_store.audit(
+                        "order.created",
+                        exchange,
+                        str(result.get("id"))
+                        if isinstance(result, dict) and result.get("id") is not None
+                        else None,
+                        key_hash,
+                        audit_payload,
+                    )
+                except Exception:
+                    metrics.storage_errors += 1
+                    logger.exception("Persistent order audit write failed")
+                return result
+
+            result = await idempotency.execute(
+                f"{exchange}:{idempotency_key}", payload, submit_and_audit
             )
             return {"exchange": exchange, "order": result}
         except ExchangeManagerError:
+            raise
+        except IdempotencyCapacityError:
+            raise
+        except IdempotencyConflictError:
             raise
         except Exception as exc:
             _raise_exchange_error(exchange, exc)
@@ -658,10 +962,19 @@ def create_app(
                 },
             )
         try:
-            return {
-                "exchange": exchange,
-                "order": await call_exchange(exchange, "cancel_order", (order_id, symbol)),
-            }
+            result = await call_exchange(exchange, "cancel_order", (order_id, symbol))
+            key_hash = hashlib.sha256(f"cancel:{exchange}:{order_id}:{symbol}".encode()).hexdigest()
+            try:
+                await history_store.audit(
+                    "order.cancelled", exchange, order_id, key_hash, {"symbol": symbol}
+                )
+            except Exception:
+                metrics.storage_errors += 1
+                logger.exception("Persistent order audit write failed")
+            logger.info(
+                "order.cancelled exchange=%s order_id=%s symbol=%s", exchange, order_id, symbol
+            )
+            return {"exchange": exchange, "order": result}
         except ExchangeManagerError:
             raise
         except Exception as exc:
@@ -671,6 +984,69 @@ def create_app(
     async def exchange_error_handler(_: Request, exc: ExchangeManagerError) -> JSONResponse:
         return JSONResponse({"error": exc.code, "message": str(exc)}, status_code=exc.status_code)
 
+    @app.exception_handler(IdempotencyConflictError)
+    async def idempotency_error_handler(_: Request, exc: IdempotencyConflictError) -> JSONResponse:
+        return JSONResponse({"error": "idempotency_conflict", "message": str(exc)}, status_code=409)
+
+    @app.exception_handler(IdempotencyCapacityError)
+    async def idempotency_capacity_handler(
+        _: Request, exc: IdempotencyCapacityError
+    ) -> JSONResponse:
+        return JSONResponse(
+            {"error": "idempotency_capacity_reached", "message": str(exc)}, status_code=503
+        )
+
+    @app.exception_handler(HTTPException)
+    async def http_error_handler(_: Request, exc: HTTPException) -> JSONResponse:
+        detail = exc.detail
+        if (
+            isinstance(detail, dict)
+            and isinstance(detail.get("error"), str)
+            and isinstance(detail.get("message"), str)
+        ):
+            body = {"error": detail["error"], "message": detail["message"]}
+        else:
+            code = {
+                401: "unauthorized",
+                403: "forbidden",
+                404: "not_found",
+                429: "rate_limit_exceeded",
+            }.get(exc.status_code, "request_failed")
+            body = {
+                "error": code,
+                "message": detail if isinstance(detail, str) else "The request failed",
+            }
+        return JSONResponse(body, status_code=exc.status_code, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+        details = [
+            {
+                "path": ".".join(str(part) for part in error.get("loc", ())),
+                "message": error.get("msg"),
+                "code": error.get("type"),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            {
+                "error": "validation_error",
+                "message": "Request validation failed",
+                "details": details,
+            },
+            status_code=422,
+        )
+
+    @app.exception_handler(Exception)
+    async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception(
+            "Unhandled request failure (request_id=%s)",
+            getattr(request.state, "request_id", "unknown"),
+        )
+        return JSONResponse(
+            {"error": "internal_error", "message": "The request failed"}, status_code=500
+        )
+
     @app.get("/health/live")
     async def health_live() -> dict[str, str]:
         return {"status": "ok"}
@@ -679,7 +1055,15 @@ def create_app(
     async def health_ready() -> dict[str, str]:
         if exchange_manager.closed:
             raise HTTPException(503, detail="shutting down")
-        return {"status": "ready"}
+        if not await history_store.ping():
+            raise HTTPException(
+                503,
+                detail={
+                    "error": "storage_unavailable",
+                    "message": "Historical storage is unavailable",
+                },
+            )
+        return {"status": "ready", "storage": "connected" if history_store.enabled else "disabled"}
 
     app.include_router(router)
 

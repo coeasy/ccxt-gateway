@@ -1,9 +1,14 @@
 import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
+import fastifySwagger from '@fastify/swagger';
+import fastifySwaggerUI from '@fastify/swagger-ui';
 import { bearerToken, secureTokenEquals } from './auth.js';
 import { AsyncTTLCache } from './cache.js';
 import { ExchangeManager, ExchangeManagerError } from './exchange-manager.js';
+import { HistoryStore } from './history-store.js';
+import { IdempotencyStore } from './idempotency.js';
 import { MarketStreamHub } from './market-stream-hub.js';
+import { RequestMetrics } from './metrics.js';
 import { TokenBucketLimiter } from './rate-limit.js';
 import { registerWebSocket } from './websocket.js';
 
@@ -29,6 +34,8 @@ const REST_METHODS = Object.freeze({
   fundingRateHistory: 'fetchFundingRateHistory', openInterest: 'fetchOpenInterest',
   openInterestHistory: 'fetchOpenInterestHistory', markPrice: 'fetchMarkPrice',
   balance: 'fetchBalance', createOrder: 'createOrder', cancelOrder: 'cancelOrder',
+  openOrders: 'fetchOpenOrders', order: 'fetchOrder', orders: 'fetchOrders', myTrades: 'fetchMyTrades',
+  positions: 'fetchPositions', tradingFee: 'fetchTradingFee',
 });
 const WEBSOCKET_METHODS = Object.freeze({
   ticker: 'watchTicker', orderbook: 'watchOrderBook', trades: 'watchTrades',
@@ -84,7 +91,9 @@ function routeError(error, reply, request, fastify) {
   if (error instanceof ExchangeManagerError) {
     return reply.code(error.statusCode).send({ error: error.code, message: error.message });
   }
+  if (error?.code?.startsWith('idempotency_')) return reply.code(error.statusCode ?? 409).send({ error: error.code, message: error.message });
   const exchange = request.params?.exchange;
+  if (exchange) fastify.gatewayMetrics.exchangeErrors += 1;
   fastify.log.error({ exchange, errorType: error?.name ?? 'Error' }, 'Exchange request failed');
   return reply.code(502).send({ error: 'exchange_request_failed', message: 'The exchange request failed' });
 }
@@ -108,7 +117,7 @@ async function callExchange(exchangeManager, exchangeId, method, args, { cache, 
   return cache.getOrCreate(JSON.stringify([exchangeId, method, args, marketType ?? null]), ttlMs, execute);
 }
 
-export function buildApp({ config, ccxt, logger = true } = {}) {
+export async function buildApp({ config, ccxt, logger = true, historyStore: providedHistoryStore } = {}) {
   if (typeof config?.apiKey !== 'string' || config.apiKey.length < 32) {
     throw new Error('API_KEY must contain at least 32 characters');
   }
@@ -138,6 +147,20 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
   });
   const cache = new AsyncTTLCache({ maxEntries: config.cacheMaxEntries });
   const limiter = new TokenBucketLimiter({ capacity: config.rateLimitRequests, windowMs: config.rateLimitWindowMs });
+  const metrics = new RequestMetrics();
+  const idempotency = new IdempotencyStore();
+  const historyStore = providedHistoryStore ?? new HistoryStore(config.databaseUrl);
+  fastify.decorate('gatewayMetrics', metrics);
+
+  await fastify.register(fastifySwagger, {
+    openapi: {
+      openapi: '3.0.3',
+      info: { title: 'CCXT Gateway API', version: '0.1.0', description: 'REST routes use a bearer API key. WebSocket clients authenticate in their first JSON frame.' },
+      components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } },
+      security: [{ bearerAuth: [] }],
+    },
+  });
+  await fastify.register(fastifySwaggerUI, { routePrefix: '/docs' });
 
   fastify.register(async (websocketScope) => {
     await websocketScope.register(fastifyWebsocket, { options: { maxPayload: 16 * 1024 } });
@@ -149,8 +172,35 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
     });
   });
 
-  fastify.get('/health/live', async () => ({ status: 'ok' }));
-  fastify.get('/health/ready', async () => ({ status: 'ready' }));
+  fastify.addHook('onRequest', async (request) => { request.gatewayStartedAt = performance.now(); });
+  fastify.addHook('onResponse', async (request, reply) => {
+    const route = request.routeOptions?.url ?? '/unmatched';
+    metrics.observe(request.method, route, reply.statusCode, Math.max(0, performance.now() - request.gatewayStartedAt) / 1000);
+  });
+  fastify.addHook('onSend', async (request, reply, payload) => {
+    reply.header('x-request-id', request.id);
+    return payload;
+  });
+
+  fastify.get('/health/live', { schema: { security: [] } }, async () => ({ status: 'ok' }));
+  fastify.get('/health/ready', { schema: { security: [] } }, async (request, reply) => {
+    if (!(await historyStore.ping())) return reply.code(503).send({ status: 'not_ready', storage: 'unavailable' });
+    return { status: 'ready', storage: historyStore.enabled ? 'connected' : 'disabled' };
+  });
+  fastify.get('/version', { schema: { security: [] } }, async () => ({ version: '0.1.0', commit: config.gitSha }));
+  fastify.get('/openapi.json', { schema: { hide: true, security: [] } }, async () => fastify.swagger());
+  fastify.get('/metrics', async (request, reply) => {
+    if (!secureTokenEquals(bearerToken(request), config.apiKey)) return reply.code(401).send({ error: 'unauthorized', message: 'A valid bearer token is required' });
+    return reply.type('text/plain; version=0.0.4; charset=utf-8').send(metrics.render({ cacheEntries: cache.values.size, exchangeInstances: exchangeManager.size, websocketStreams: streamHub.streams.size }));
+  });
+  fastify.addHook('onReady', async () => historyStore.initialize());
+  fastify.setErrorHandler((error, request, reply) => {
+    if (error.validation) return reply.code(400).send({ error: 'validation_error', message: 'Request validation failed', details: error.validation.map(({ instancePath, message }) => ({ path: instancePath, message })) });
+    const status = Number.isInteger(error.statusCode) ? error.statusCode : 500;
+    const code = status === 404 ? 'not_found' : status === 401 ? 'unauthorized' : 'request_failed';
+    if (status >= 500) fastify.log.error({ errorType: error?.name ?? 'Error' }, 'Request failed');
+    return reply.code(status).send({ error: code, message: status >= 500 ? 'The request failed' : error.message });
+  });
 
   const authenticate = async (request, reply) => {
     if (!secureTokenEquals(bearerToken(request), config.apiKey)) {
@@ -249,6 +299,8 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
   fastify.get('/v1/:exchange/trades', { schema: { params: EXCHANGE_PARAM, querystring: TRADES_QUERY } }, async (request, reply) => {
     try {
       const trades = await callExchange(exchangeManager, request.params.exchange, 'fetchTrades', [request.query.symbol, request.query.since, request.query.limit, paginationParams(request.query, { forwardSince: true })], { cache, ttlMs: config.cacheTradesTtlMs });
+      try { await historyStore.saveTrades(request.params.exchange, request.query.symbol, trades); }
+      catch (error) { metrics.storageErrors += 1; fastify.log.error({ errorType: error?.name ?? 'Error' }, 'Failed to archive exchange trades'); }
       return { exchange: request.params.exchange, symbol: request.query.symbol, trades };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
@@ -256,8 +308,37 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
   fastify.get('/v1/:exchange/ohlcv', { schema: { params: EXCHANGE_PARAM, querystring: OHLCV_QUERY } }, async (request, reply) => {
     try {
       const candles = await callExchange(exchangeManager, request.params.exchange, 'fetchOHLCV', [request.query.symbol, request.query.timeframe, request.query.since, request.query.limit, { ...(request.query.price ? { price: request.query.price } : {}), ...paginationParams(request.query) }], { cache, ttlMs: config.cacheOhlcvTtlMs, marketType: request.query.price ? 'contract' : undefined });
+      try { await historyStore.saveCandles(request.params.exchange, request.query.symbol, request.query.timeframe, candles, request.query.price ?? 'last'); }
+      catch (error) { metrics.storageErrors += 1; fastify.log.error({ errorType: error?.name ?? 'Error' }, 'Failed to archive exchange candles'); }
       return { exchange: request.params.exchange, symbol: request.query.symbol, timeframe: request.query.timeframe, price: request.query.price ?? 'last', candles };
     } catch (error) { return routeError(error, reply, request, fastify); }
+  });
+
+  const ARCHIVE_QUERY = {
+    type: 'object', required: ['exchange', 'symbol'], additionalProperties: false,
+    properties: {
+      exchange: { type: 'string', pattern: '^[a-z0-9]+$' }, symbol: { type: 'string', minLength: 1, maxLength: 64 },
+      timeframe: { type: 'string', minLength: 1, maxLength: 16 }, price: { type: 'string', enum: ['last', 'mark', 'index', 'premiumIndex'], default: 'last' },
+      since: { type: 'integer', minimum: 0 }, until: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000, default: 1000 },
+    },
+  };
+  fastify.get('/v1/archive/ohlcv', { schema: { querystring: { ...ARCHIVE_QUERY, required: ['exchange', 'symbol', 'timeframe'] } } }, async (request, reply) => {
+    if (!historyStore.enabled) return reply.code(503).send({ error: 'storage_not_configured', message: 'Set DATABASE_URL to enable archived market data' });
+    if (request.query.until !== undefined && request.query.since !== undefined && request.query.until < request.query.since) return reply.code(400).send({ error: 'invalid_time_range', message: 'until must be greater than or equal to since' });
+    try {
+      const candles = await historyStore.query('ohlcv', { ...request.query, timeframe: `${request.query.timeframe}:${request.query.price ?? 'last'}` });
+      return { source: 'archive', exchange: request.query.exchange, symbol: request.query.symbol, timeframe: request.query.timeframe, price: request.query.price ?? 'last', candles };
+    } catch (error) { fastify.log.error({ errorType: error?.name ?? 'Error' }, 'History query failed'); return reply.code(503).send({ error: 'storage_unavailable', message: 'Historical storage is temporarily unavailable' }); }
+  });
+  fastify.get('/v1/archive/trades', {
+    schema: { querystring: { type: 'object', required: ['exchange', 'symbol'], additionalProperties: false, properties: { exchange: ARCHIVE_QUERY.properties.exchange, symbol: ARCHIVE_QUERY.properties.symbol, since: ARCHIVE_QUERY.properties.since, until: ARCHIVE_QUERY.properties.until, limit: ARCHIVE_QUERY.properties.limit } } },
+  }, async (request, reply) => {
+    if (!historyStore.enabled) return reply.code(503).send({ error: 'storage_not_configured', message: 'Set DATABASE_URL to enable archived market data' });
+    if (request.query.until !== undefined && request.query.since !== undefined && request.query.until < request.query.since) return reply.code(400).send({ error: 'invalid_time_range', message: 'until must be greater than or equal to since' });
+    try {
+      const trades = await historyStore.query('trades', request.query);
+      return { source: 'archive', exchange: request.query.exchange, symbol: request.query.symbol, trades };
+    } catch (error) { fastify.log.error({ errorType: error?.name ?? 'Error' }, 'History query failed'); return reply.code(503).send({ error: 'storage_unavailable', message: 'Historical storage is temporarily unavailable' }); }
   });
 
   fastify.get('/v1/:exchange/funding-rate', { schema: { params: EXCHANGE_PARAM, querystring: SYMBOL_QUERY } }, async (request, reply) => {
@@ -312,9 +393,45 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
+  const PRIVATE_QUERY = { type: 'object', additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 }, since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000, default: 100 } } };
+  const privateGuard = (exchange, reply) => {
+    if (exchangeManager.hasCredentials(exchange)) return true;
+    reply.code(403).send({ error: 'credentials_not_configured', message: 'No exchange credentials are configured' });
+    return false;
+  };
+  const privateRoute = async (request, reply, method, args) => {
+    if (!privateGuard(request.params.exchange, reply)) return reply;
+    try {
+      const value = await callExchange(exchangeManager, request.params.exchange, method, args);
+      const responseKey = method === 'fetchPositions' ? 'positions' : method === 'fetchTradingFee' ? 'fee' : method === 'fetchMyTrades' ? 'trades' : 'orders';
+      return { exchange: request.params.exchange, [responseKey]: value };
+    } catch (error) { return routeError(error, reply, request, fastify); }
+  };
+
+  fastify.get('/v1/:exchange/open-orders', { schema: { params: EXCHANGE_PARAM, querystring: PRIVATE_QUERY } }, async (request, reply) => privateRoute(request, reply, 'fetchOpenOrders', [request.query.symbol]));
+  fastify.get('/v1/:exchange/order/:order_id', {
+    schema: { params: { type: 'object', required: ['exchange', 'order_id'], properties: { exchange: { type: 'string', pattern: '^[a-z0-9]+$' }, order_id: { type: 'string', minLength: 1, maxLength: 128 } }, additionalProperties: false }, querystring: SYMBOL_QUERY },
+  }, async (request, reply) => {
+    if (!privateGuard(request.params.exchange, reply)) return reply;
+    try { return { exchange: request.params.exchange, order: await callExchange(exchangeManager, request.params.exchange, 'fetchOrder', [request.params.order_id, request.query.symbol]) }; }
+    catch (error) { return routeError(error, reply, request, fastify); }
+  });
+  fastify.get('/v1/:exchange/orders/history', { schema: { params: EXCHANGE_PARAM, querystring: { ...PRIVATE_QUERY, required: ['symbol'] } } }, async (request, reply) => privateRoute(request, reply, 'fetchOrders', [request.query.symbol, request.query.since, request.query.limit]));
+  fastify.get('/v1/:exchange/my-trades', { schema: { params: EXCHANGE_PARAM, querystring: { ...PRIVATE_QUERY, required: ['symbol'] } } }, async (request, reply) => privateRoute(request, reply, 'fetchMyTrades', [request.query.symbol, request.query.since, request.query.limit]));
+  fastify.get('/v1/:exchange/positions', {
+    schema: { params: EXCHANGE_PARAM, querystring: { type: 'object', additionalProperties: false, properties: { symbols: { type: 'string', minLength: 1, maxLength: 3249 } } } },
+  }, async (request, reply) => {
+    let symbols;
+    try { symbols = request.query.symbols ? parseSymbols(request.query.symbols) : undefined; }
+    catch (error) { return routeError(error, reply, request, fastify); }
+    return privateRoute(request, reply, 'fetchPositions', [symbols]);
+  });
+  fastify.get('/v1/:exchange/trading-fee', { schema: { params: EXCHANGE_PARAM, querystring: SYMBOL_QUERY } }, async (request, reply) => privateRoute(request, reply, 'fetchTradingFee', [request.query.symbol]));
+
   fastify.post('/v1/:exchange/order', {
     schema: {
       params: EXCHANGE_PARAM,
+      headers: { type: 'object', required: ['idempotency-key'], properties: { 'idempotency-key': { type: 'string', minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9._:-]+$' } }, additionalProperties: true },
       body: {
         type: 'object', additionalProperties: false, required: ['symbol', 'type', 'side', 'amount'],
         properties: {
@@ -331,19 +448,31 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
     if (!exchangeManager.hasCredentials(request.params.exchange)) {
       return reply.code(403).send({ error: 'credentials_not_configured', message: 'No exchange credentials are configured' });
     }
+    if (!config.tradingEnabled) return reply.code(403).send({ error: 'trading_disabled', message: 'Set TRADING_ENABLED=true to enable order submission' });
     const { symbol, type, side, amount, price, params = {} } = request.body;
+    if (type === 'market' && !config.marketOrdersEnabled) return reply.code(403).send({ error: 'market_orders_disabled', message: 'Set MARKET_ORDERS_ENABLED=true to enable market orders' });
     if (type === 'limit' && price === undefined) {
       return reply.code(400).send({ error: 'price_required', message: 'Limit orders require a price' });
     }
     try {
-      const order = await callExchange(exchangeManager, request.params.exchange, 'createOrder', [symbol, type, side, amount, price, params]);
+      const idempotencyKey = request.headers['idempotency-key'];
+      const orderPayload = { exchange: request.params.exchange, symbol, type, side, amount, price: price ?? null, params };
+      const order = await idempotency.execute(`${request.params.exchange}:${idempotencyKey}`, orderPayload, async () => {
+        const created = await callExchange(exchangeManager, request.params.exchange, 'createOrder', [symbol, type, side, amount, price, params]);
+        const idempotencyHash = IdempotencyStore.fingerprint(idempotencyKey);
+        const auditPayload = { symbol, type, side, amount, price: price ?? null, requestId: request.id };
+        fastify.log.info({ event: 'order.created', exchange: request.params.exchange, orderId: created?.id, idempotencyHash, ...auditPayload }, 'Order audit');
+        try { await historyStore.audit('order.created', request.params.exchange, created?.id, idempotencyHash, auditPayload); }
+        catch (error) { fastify.log.error({ errorType: error?.name ?? 'Error', exchange: request.params.exchange }, 'Persistent order audit write failed'); }
+        return created;
+      });
       return reply.code(201).send({ exchange: request.params.exchange, order });
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
-  fastify.delete('/v1/:exchange/order/:id', {
+  fastify.delete('/v1/:exchange/order/:order_id', {
     schema: {
-      params: { type: 'object', required: ['exchange', 'id'], properties: { exchange: { type: 'string', pattern: '^[a-z0-9]+$' }, id: { type: 'string', minLength: 1, maxLength: 128 } } },
+      params: { type: 'object', required: ['exchange', 'order_id'], properties: { exchange: { type: 'string', pattern: '^[a-z0-9]+$' }, order_id: { type: 'string', minLength: 1, maxLength: 128 } } },
       querystring: SYMBOL_QUERY,
     },
   }, async (request, reply) => {
@@ -351,7 +480,12 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
       return reply.code(403).send({ error: 'credentials_not_configured', message: 'No exchange credentials are configured' });
     }
     try {
-      const order = await callExchange(exchangeManager, request.params.exchange, 'cancelOrder', [request.params.id, request.query.symbol]);
+      const order = await callExchange(exchangeManager, request.params.exchange, 'cancelOrder', [request.params.order_id, request.query.symbol]);
+      const keyHash = IdempotencyStore.fingerprint(`cancel:${request.params.exchange}:${request.params.order_id}:${request.query.symbol}`);
+      const auditPayload = { symbol: request.query.symbol, requestId: request.id };
+      fastify.log.info({ event: 'order.cancelled', exchange: request.params.exchange, orderId: request.params.order_id, ...auditPayload }, 'Order audit');
+      try { await historyStore.audit('order.cancelled', request.params.exchange, request.params.order_id, keyHash, auditPayload); }
+      catch (error) { metrics.storageErrors += 1; fastify.log.error({ errorType: error?.name ?? 'Error' }, 'Persistent order audit write failed'); }
       return { exchange: request.params.exchange, order };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
@@ -360,6 +494,7 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
     await streamHub.close();
     await exchangeManager.close();
     cache.clear();
+    await historyStore.close();
   });
 
   return { fastify, exchangeManager, streamHub };

@@ -19,6 +19,12 @@ export function createFakeCcxt({ watchDelayMs = 5 } = {}) {
         fetchBalance: true,
         createOrder: true,
         cancelOrder: true,
+        fetchOpenOrders: true,
+        fetchOrder: true,
+        fetchOrders: true,
+        fetchMyTrades: true,
+        fetchPositions: true,
+        fetchTradingFee: true,
         watchTicker: true,
         watchFundingRate: true,
         watchMarkPrice: true,
@@ -56,6 +62,12 @@ export function createFakeCcxt({ watchDelayMs = 5 } = {}) {
       return { id: 'order-1', symbol, type, side, amount, price: price ?? null, params };
     }
     async cancelOrder(id, symbol) { return { id, symbol, status: 'canceled' }; }
+    async fetchOpenOrders(symbol) { return [{ id: 'open-1', symbol: symbol ?? 'BTC/USDT' }]; }
+    async fetchOrder(id, symbol) { return { id, symbol, status: 'open' }; }
+    async fetchOrders(symbol, since, limit) { return [{ id: 'history-1', symbol, since: since ?? null, limit: limit ?? 100 }]; }
+    async fetchMyTrades(symbol, since, limit) { return [{ id: 'trade-1', symbol, since: since ?? null, limit: limit ?? 100 }]; }
+    async fetchPositions(symbols) { return [{ symbol: symbols?.[0] ?? 'BTC/USDT:USDT', contracts: 1 }]; }
+    async fetchTradingFee(symbol) { return { symbol, maker: 0.001, taker: 0.001 }; }
     async watchTicker(symbol) {
       metrics.watchCalls += 1;
       metrics.activeWatches += 1;

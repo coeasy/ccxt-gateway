@@ -39,6 +39,10 @@ class GatewayConfig:
     cache_markets_ttl: float = 300.0
     rate_limit_requests: int = 120
     rate_limit_window: float = 60.0
+    database_url: str | None = None
+    trading_enabled: bool = False
+    market_orders_enabled: bool = False
+    git_sha: str = "unknown"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> GatewayConfig:
@@ -86,4 +90,8 @@ class GatewayConfig:
             cache_markets_ttl=_positive_int(source, "CACHE_MARKETS_TTL_SECONDS", 300),
             rate_limit_requests=_positive_int(source, "RATE_LIMIT_REQUESTS", 120),
             rate_limit_window=_positive_int(source, "RATE_LIMIT_WINDOW_SECONDS", 60),
+            database_url=source.get("DATABASE_URL", "").strip() or None,
+            trading_enabled=source.get("TRADING_ENABLED", "").lower() == "true",
+            market_orders_enabled=source.get("MARKET_ORDERS_ENABLED", "").lower() == "true",
+            git_sha=(source.get("GIT_SHA") or source.get("GITHUB_SHA") or "unknown")[:64],
         )

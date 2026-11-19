@@ -7,7 +7,7 @@ const authorization = { authorization: 'Bearer test-api-key-0123456789abcdef-012
 
 test('health endpoints are public while gateway endpoints require bearer authentication', async (t) => {
   const { ccxt } = createFakeCcxt();
-  const app = buildApp({ config: testConfig(), ccxt, logger: false }).fastify;
+  const app = (await buildApp({ config: testConfig(), ccxt, logger: false })).fastify;
   t.after(() => app.close());
 
   const health = await app.inject({ method: 'GET', url: '/health/live' });
@@ -24,7 +24,7 @@ test('health endpoints are public while gateway endpoints require bearer authent
 
 test('REST requests share a cached exchange instance and validate request input', async (t) => {
   const { ccxt, metrics } = createFakeCcxt();
-  const app = buildApp({ config: testConfig(), ccxt, logger: false }).fastify;
+  const app = (await buildApp({ config: testConfig(), ccxt, logger: false })).fastify;
   t.after(() => app.close());
 
   const first = await app.inject({ method: 'GET', url: '/v1/binance/ticker?symbol=BTC%2FUSDT', headers: authorization });
@@ -43,7 +43,7 @@ test('REST requests share a cached exchange instance and validate request input'
 
 test('market filters, historical query parameters, and contract metrics reach CCXT', async (t) => {
   const { ccxt } = createFakeCcxt();
-  const app = buildApp({ config: testConfig(), ccxt, logger: false }).fastify;
+  const app = (await buildApp({ config: testConfig(), ccxt, logger: false })).fastify;
   t.after(() => app.close());
 
   const markets = await app.inject({
@@ -98,7 +98,7 @@ test('market filters, historical query parameters, and contract metrics reach CC
 
 test('capability discovery and batch ticker requests expose CCXT support', async (t) => {
   const { ccxt } = createFakeCcxt();
-  const app = buildApp({ config: testConfig(), ccxt, logger: false }).fastify;
+  const app = (await buildApp({ config: testConfig(), ccxt, logger: false })).fastify;
   t.after(() => app.close());
 
   const capabilities = await app.inject({
@@ -118,7 +118,7 @@ test('capability discovery and batch ticker requests expose CCXT support', async
 
 test('gateway token bucket returns 429 with a retry window after the configured capacity', async (t) => {
   const { ccxt } = createFakeCcxt();
-  const app = buildApp({ config: testConfig({ rateLimitRequests: 1 }), ccxt, logger: false }).fastify;
+  const app = (await buildApp({ config: testConfig({ rateLimitRequests: 1 }), ccxt, logger: false })).fastify;
   t.after(() => app.close());
 
   const first = await app.inject({ method: 'GET', url: '/v1/exchanges', headers: authorization });
@@ -130,20 +130,24 @@ test('gateway token bucket returns 429 with a retry window after the configured 
 
 test('private methods require configured exchange credentials and reject unsafe limit orders', async (t) => {
   const { ccxt, metrics } = createFakeCcxt();
-  const app = buildApp({
-    config: testConfig({ exchangeCredentials: { binance: { apiKey: 'test-key', secret: 'test-secret' } } }),
+  const app = (await buildApp({
+    config: testConfig({
+      exchangeCredentials: { binance: { apiKey: 'test-key', secret: 'test-secret' } },
+      tradingEnabled: true,
+      marketOrdersEnabled: true,
+    }),
     ccxt,
     logger: false,
-  }).fastify;
+  })).fastify;
   t.after(() => app.close());
 
   const balance = await app.inject({ method: 'GET', url: '/v1/binance/balance', headers: authorization });
   const missingPrice = await app.inject({
-    method: 'POST', url: '/v1/binance/order', headers: { ...authorization, 'content-type': 'application/json' },
+    method: 'POST', url: '/v1/binance/order', headers: { ...authorization, 'content-type': 'application/json', 'idempotency-key': 'missing-price-001' },
     payload: { symbol: 'BTC/USDT', type: 'limit', side: 'buy', amount: 0.1 },
   });
   const order = await app.inject({
-    method: 'POST', url: '/v1/binance/order', headers: { ...authorization, 'content-type': 'application/json' },
+    method: 'POST', url: '/v1/binance/order', headers: { ...authorization, 'content-type': 'application/json', 'idempotency-key': 'market-order-001' },
     payload: { symbol: 'BTC/USDT', type: 'market', side: 'buy', amount: 0.1 },
   });
 
@@ -153,9 +157,85 @@ test('private methods require configured exchange credentials and reject unsafe 
   assert.equal(metrics.orderCalls, 1);
 });
 
+test('OpenAPI, authenticated metrics, and request IDs are available', async (t) => {
+  const { ccxt } = createFakeCcxt();
+  const app = (await buildApp({ config: testConfig(), ccxt, logger: false })).fastify;
+  t.after(() => app.close());
+
+  const spec = await app.inject({ method: 'GET', url: '/openapi.json' });
+  const docs = await app.inject({ method: 'GET', url: '/docs/' });
+  const denied = await app.inject({ method: 'GET', url: '/metrics' });
+  const metricsResponse = await app.inject({ method: 'GET', url: '/metrics', headers: authorization });
+  const version = await app.inject({ method: 'GET', url: '/version' });
+
+  assert.equal(spec.statusCode, 200);
+  assert.equal(docs.statusCode, 200);
+  assert.ok(spec.json().paths['/v1/{exchange}/positions']);
+  assert.ok(spec.json().components.securitySchemes.bearerAuth);
+  assert.equal(denied.statusCode, 401);
+  assert.equal(metricsResponse.statusCode, 200);
+  assert.match(metricsResponse.body, /ccxt_gateway_http_requests_total/);
+  assert.ok(version.headers['x-request-id']);
+});
+
+test('private account read routes and archived market data use the shared API shape', async (t) => {
+  const { ccxt } = createFakeCcxt();
+  const stored = [];
+  const historyStore = {
+    enabled: true,
+    async initialize() {},
+    async ping() { return true; },
+    async saveCandles(exchange, symbol, timeframe, rows, price) { stored.push({ kind: 'ohlcv', exchange, symbol, timeframe, rows, price }); },
+    async saveTrades(exchange, symbol, rows) { stored.push({ kind: 'trades', exchange, symbol, rows }); },
+    async query(kind, query) { return [{ kind, query, archived: true }]; },
+    async audit() {},
+    async close() {},
+  };
+  const app = (await buildApp({ config: testConfig({ exchangeCredentials: { binance: { apiKey: 'test', secret: 'test' } } }), ccxt, logger: false, historyStore })).fastify;
+  t.after(() => app.close());
+
+  const openOrders = await app.inject({ method: 'GET', url: '/v1/binance/open-orders', headers: authorization });
+  const myTrades = await app.inject({ method: 'GET', url: '/v1/binance/my-trades?symbol=BTC%2FUSDT', headers: authorization });
+  const candles = await app.inject({ method: 'GET', url: '/v1/binance/ohlcv?symbol=BTC%2FUSDT&timeframe=1h', headers: authorization });
+  const archive = await app.inject({ method: 'GET', url: '/v1/archive/ohlcv?exchange=binance&symbol=BTC%2FUSDT&timeframe=1h', headers: authorization });
+
+  assert.equal(openOrders.json().orders[0].id, 'open-1');
+  assert.equal(myTrades.json().trades[0].id, 'trade-1');
+  assert.equal(candles.statusCode, 200);
+  assert.equal(stored.length, 1);
+  assert.equal(archive.json().source, 'archive');
+});
+
+test('order submission requires explicit enablement and reuses idempotent results', async (t) => {
+  const { ccxt, metrics } = createFakeCcxt();
+  const credentials = { binance: { apiKey: 'test', secret: 'test' } };
+  const disabled = (await buildApp({ config: testConfig({ exchangeCredentials: credentials }), ccxt, logger: false })).fastify;
+  t.after(() => disabled.close());
+  const blocked = await disabled.inject({
+    method: 'POST', url: '/v1/binance/order', headers: { ...authorization, 'content-type': 'application/json', 'idempotency-key': 'disabled-order' },
+    payload: { symbol: 'BTC/USDT', type: 'limit', side: 'buy', amount: 1, price: 10 },
+  });
+  assert.equal(blocked.statusCode, 403);
+  assert.equal(blocked.json().error, 'trading_disabled');
+
+  const enabled = (await buildApp({ config: testConfig({ exchangeCredentials: credentials, tradingEnabled: true }), ccxt, logger: false })).fastify;
+  t.after(() => enabled.close());
+  const request = {
+    method: 'POST', url: '/v1/binance/order', headers: { ...authorization, 'content-type': 'application/json', 'idempotency-key': 'limit-order-001' },
+    payload: { symbol: 'BTC/USDT', type: 'limit', side: 'buy', amount: 1, price: 10 },
+  };
+  const first = await enabled.inject(request);
+  const replay = await enabled.inject(request);
+  const conflict = await enabled.inject({ ...request, payload: { ...request.payload, amount: 2 } });
+  assert.equal(first.statusCode, 201);
+  assert.equal(replay.statusCode, 201);
+  assert.equal(conflict.statusCode, 409);
+  assert.equal(metrics.orderCalls, 1);
+});
+
 test('private methods fail closed when exchange credentials are absent', async (t) => {
   const { ccxt } = createFakeCcxt();
-  const app = buildApp({ config: testConfig(), ccxt, logger: false }).fastify;
+  const app = (await buildApp({ config: testConfig(), ccxt, logger: false })).fastify;
   t.after(() => app.close());
 
   const response = await app.inject({ method: 'GET', url: '/v1/binance/balance', headers: authorization });

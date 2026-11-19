@@ -3,7 +3,7 @@ import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 
 const config = loadConfig();
-const { fastify } = buildApp({ config, ccxt });
+const { fastify } = await buildApp({ config, ccxt });
 
 try {
   await fastify.listen({ host: config.host, port: config.port });

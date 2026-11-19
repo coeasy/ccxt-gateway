@@ -29,6 +29,12 @@ class FakeExchange:
                 "fetchBalance",
                 "createOrder",
                 "cancelOrder",
+                "fetchOpenOrders",
+                "fetchOrder",
+                "fetchOrders",
+                "fetchMyTrades",
+                "fetchPositions",
+                "fetchTradingFee",
                 "watchTicker",
                 "watchFundingRate",
                 "watchMarkPrice",
@@ -127,6 +133,7 @@ class FakeExchange:
 
     async def fetch_mark_price(self, symbol):
         return {"symbol": symbol, "markPrice": 123.4}
+
     async def fetch_balance(self):
         self.metrics["balance_calls"] += 1
         return {"USDT": {"free": 10}}
@@ -144,6 +151,24 @@ class FakeExchange:
 
     async def cancel_order(self, order_id, symbol):
         return {"id": order_id, "symbol": symbol, "status": "canceled"}
+
+    async def fetch_open_orders(self, symbol=None):
+        return [{"id": "open-1", "symbol": symbol or "BTC/USDT"}]
+
+    async def fetch_order(self, order_id, symbol):
+        return {"id": order_id, "symbol": symbol, "status": "open"}
+
+    async def fetch_orders(self, symbol, since=None, limit=None):
+        return [{"id": "history-1", "symbol": symbol, "since": since, "limit": limit}]
+
+    async def fetch_my_trades(self, symbol, since=None, limit=None):
+        return [{"id": "trade-1", "symbol": symbol, "since": since, "limit": limit}]
+
+    async def fetch_positions(self, symbols=None):
+        return [{"symbol": symbols[0] if symbols else "BTC/USDT:USDT", "contracts": 1}]
+
+    async def fetch_trading_fee(self, symbol):
+        return {"symbol": symbol, "maker": 0.001, "taker": 0.001}
 
     async def watch_ticker(self, symbol):
         self.metrics["watch_calls"] += 1

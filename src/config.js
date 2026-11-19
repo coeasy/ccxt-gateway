@@ -76,6 +76,10 @@ export function loadConfig(env = process.env) {
     cacheMarketsTtlMs: positiveInteger(env.CACHE_MARKETS_TTL_MS, 'CACHE_MARKETS_TTL_MS', DEFAULTS.cacheMarketsTtlMs),
     rateLimitRequests: positiveInteger(env.RATE_LIMIT_REQUESTS, 'RATE_LIMIT_REQUESTS', DEFAULTS.rateLimitRequests),
     rateLimitWindowMs: positiveInteger(env.RATE_LIMIT_WINDOW_MS, 'RATE_LIMIT_WINDOW_MS', DEFAULTS.rateLimitWindowMs),
+    databaseUrl: env.DATABASE_URL?.trim() || null,
+    tradingEnabled: env.TRADING_ENABLED?.toLowerCase() === 'true',
+    marketOrdersEnabled: env.MARKET_ORDERS_ENABLED?.toLowerCase() === 'true',
+    gitSha: (env.GIT_SHA || env.GITHUB_SHA || 'unknown').slice(0, 64),
     nodeEnv: env.NODE_ENV || 'development',
   });
 }

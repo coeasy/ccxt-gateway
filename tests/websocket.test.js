@@ -23,7 +23,7 @@ function nextMessage(socket, predicate, timeoutMs = 3000) {
 
 test('WebSocket requires first-frame auth and shares live CCXT streams', async (t) => {
   const { ccxt, metrics } = createFakeCcxt({ watchDelayMs: 10 });
-  const { fastify } = buildApp({ config: testConfig(), ccxt, logger: false });
+  const { fastify } = await buildApp({ config: testConfig(), ccxt, logger: false });
   await fastify.listen({ host: '127.0.0.1', port: 0 });
   const address = fastify.server.address();
   const url = `ws://127.0.0.1:${address.port}/ws`;
@@ -99,7 +99,7 @@ test('WebSocket requires first-frame auth and shares live CCXT streams', async (
 
 test('limits distinct upstream WebSocket streams', async (t) => {
   const { ccxt } = createFakeCcxt();
-  const { fastify } = buildApp({ config: testConfig({ wsMaxStreams: 1 }), ccxt, logger: false });
+  const { fastify } = await buildApp({ config: testConfig({ wsMaxStreams: 1 }), ccxt, logger: false });
   await fastify.listen({ host: '127.0.0.1', port: 0 });
   const address = fastify.server.address();
   const socket = new WebSocket(`ws://127.0.0.1:${address.port}/ws`);
@@ -127,7 +127,7 @@ test('limits distinct upstream WebSocket streams', async (t) => {
 
 test('rejects an invalid WebSocket token before opening an exchange stream', async (t) => {
   const { ccxt, metrics } = createFakeCcxt();
-  const { fastify } = buildApp({ config: testConfig(), ccxt, logger: false });
+  const { fastify } = await buildApp({ config: testConfig(), ccxt, logger: false });
   await fastify.listen({ host: '127.0.0.1', port: 0 });
   const address = fastify.server.address();
   const socket = new WebSocket(`ws://127.0.0.1:${address.port}/ws`);

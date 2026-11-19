@@ -11,9 +11,10 @@ def headers(config):
 
 def test_rest_auth_cache_private_guard_and_order(exchange_modules, gateway_config):
     rest, pro, metrics = exchange_modules
-    app = create_app(gateway_config, rest, pro)
+    config = replace(gateway_config, trading_enabled=True, market_orders_enabled=True)
+    app = create_app(config, rest, pro)
     with TestClient(app) as client:
-        assert client.get("/health/ready").json() == {"status": "ready"}
+        assert client.get("/health/ready").json() == {"status": "ready", "storage": "disabled"}
         assert client.get("/v1/exchanges").status_code == 401
         response = client.get(
             "/v1/binance/ticker", params={"symbol": "BTC/USDT"}, headers=headers(gateway_config)
@@ -27,7 +28,7 @@ def test_rest_auth_cache_private_guard_and_order(exchange_modules, gateway_confi
         assert client.get("/v1/kraken/balance", headers=headers(gateway_config)).status_code == 403
         placed = client.post(
             "/v1/binance/order",
-            headers=headers(gateway_config),
+            headers={**headers(config), "Idempotency-Key": "test-order-0001"},
             json={"symbol": "BTC/USDT", "type": "limit", "side": "buy", "amount": 1, "price": 10},
         )
         assert placed.status_code == 201
@@ -35,7 +36,7 @@ def test_rest_auth_cache_private_guard_and_order(exchange_modules, gateway_confi
         assert (
             client.post(
                 "/v1/binance/order",
-                headers=headers(gateway_config),
+                headers={**headers(config), "Idempotency-Key": "test-order-0002"},
                 json={"symbol": "BTC/USDT", "type": "limit", "side": "buy", "amount": 1},
             ).status_code
             == 400
@@ -64,12 +65,8 @@ def test_market_filters_history_and_contract_metrics(exchange_modules, gateway_c
             params={"type": "swap", "base": "btc", "quote": "usdt"},
             headers=auth,
         )
-        contracts = client.get(
-            "/v1/binance/markets", params={"type": "contract"}, headers=auth
-        )
-        margin_markets = client.get(
-            "/v1/binance/markets", params={"type": "margin"}, headers=auth
-        )
+        contracts = client.get("/v1/binance/markets", params={"type": "contract"}, headers=auth)
+        margin_markets = client.get("/v1/binance/markets", params={"type": "margin"}, headers=auth)
         trades = client.get(
             "/v1/binance/trades",
             params={
@@ -216,3 +213,127 @@ def test_websocket_exposes_contract_funding_stream(exchange_modules, gateway_con
             update = socket.receive_json()
             assert update["channel"] == "fundingRate"
             assert update["data"]["fundingRate"] == 0.0001
+
+
+def test_openapi_metrics_and_request_ids(exchange_modules, gateway_config):
+    rest, pro, _ = exchange_modules
+    app = create_app(gateway_config, rest, pro)
+    with TestClient(app) as client:
+        docs = client.get("/docs")
+        spec = client.get("/openapi.json")
+        denied = client.get("/metrics")
+        metrics = client.get("/metrics", headers=headers(gateway_config))
+        version = client.get("/version")
+
+    assert docs.status_code == 200
+    assert spec.status_code == 200
+    assert "/v1/{exchange}/positions" in spec.json()["paths"]
+    assert "HTTPBearer" in spec.json()["components"]["securitySchemes"]
+    assert denied.status_code == 401
+    assert metrics.status_code == 200
+    assert "ccxt_gateway_http_requests_total" in metrics.text
+    assert version.headers.get("x-request-id")
+
+
+def test_account_read_routes_and_archived_market_data(exchange_modules, gateway_config):
+    rest, pro, _ = exchange_modules
+
+    class HistoryStore:
+        enabled = True
+
+        async def initialize(self):
+            return None
+
+        async def ping(self):
+            return True
+
+        async def save_candles(self, *args):
+            self.candles = args
+
+        async def save_trades(self, *args):
+            self.trades = args
+
+        async def query(
+            self, kind, exchange, symbol, timeframe="", since=None, until=None, limit=1000
+        ):
+            return [{"kind": kind, "exchange": exchange, "symbol": symbol, "timeframe": timeframe}]
+
+        async def audit(self, *args):
+            return None
+
+        async def close(self):
+            return None
+
+    history_store = HistoryStore()
+    app = create_app(gateway_config, rest, pro, history_store_backend=history_store)
+    auth = headers(gateway_config)
+    with TestClient(app) as client:
+        open_orders = client.get("/v1/binance/open-orders", headers=auth)
+        order = client.get("/v1/binance/order/order-1", params={"symbol": "BTC/USDT"}, headers=auth)
+        positions = client.get(
+            "/v1/binance/positions", params={"symbols": "BTC/USDT:USDT"}, headers=auth
+        )
+        fee = client.get("/v1/binance/trading-fee", params={"symbol": "BTC/USDT"}, headers=auth)
+        my_trades = client.get("/v1/binance/my-trades", params={"symbol": "BTC/USDT"}, headers=auth)
+        candles = client.get(
+            "/v1/binance/ohlcv",
+            params={"symbol": "BTC/USDT", "timeframe": "1h"},
+            headers=auth,
+        )
+        archived = client.get(
+            "/v1/archive/ohlcv",
+            params={
+                "exchange": "binance",
+                "symbol": "BTC/USDT",
+                "timeframe": "1h",
+            },
+            headers=auth,
+        )
+
+    assert open_orders.json()["orders"][0]["id"] == "open-1"
+    assert order.json()["order"]["id"] == "order-1"
+    assert positions.json()["positions"][0]["contracts"] == 1
+    assert fee.json()["fee"]["maker"] == 0.001
+    assert my_trades.json()["trades"][0]["id"] == "trade-1"
+    assert candles.status_code == 200
+    assert history_store.candles[2:4] == ("1h", [[0, 1, 2, 3, 4, 5, "1h", 100, False, None]])
+    assert archived.json()["source"] == "archive"
+
+
+def test_orders_are_disabled_by_default_and_idempotent_when_enabled(
+    exchange_modules, gateway_config
+):
+    rest, pro, metrics = exchange_modules
+    payload = {
+        "symbol": "BTC/USDT",
+        "type": "limit",
+        "side": "buy",
+        "amount": 1,
+        "price": 10,
+    }
+    app = create_app(gateway_config, rest, pro)
+    with TestClient(app) as client:
+        blocked = client.post(
+            "/v1/binance/order",
+            headers={**headers(gateway_config), "Idempotency-Key": "disabled-order-1"},
+            json=payload,
+        )
+    assert blocked.status_code == 403
+    assert blocked.json()["error"] == "trading_disabled"
+
+    config = replace(gateway_config, trading_enabled=True)
+    app = create_app(config, rest, pro)
+    request_headers = {**headers(config), "Idempotency-Key": "limit-order-0001"}
+    with TestClient(app) as client:
+        first = client.post("/v1/binance/order", headers=request_headers, json=payload)
+        replay = client.post("/v1/binance/order", headers=request_headers, json=payload)
+        conflict = client.post(
+            "/v1/binance/order",
+            headers=request_headers,
+            json={**payload, "amount": 2},
+        )
+
+    assert first.status_code == 201
+    assert replay.status_code == 201
+    assert conflict.status_code == 409
+    assert metrics["order_calls"] == 1

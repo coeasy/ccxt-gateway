@@ -7,7 +7,7 @@
 | Node.js | repository root | Fastify + CCXT Pro | `/` | `/Dockerfile` |
 | Python | [`python/`](python/README.md) | FastAPI + CCXT Async + CCXT Pro | `/python` | `/Dockerfile` |
 
-Both expose authenticated REST and WebSocket APIs, reuse exchange connections, coalesce identical market-data requests, apply gateway rate limits, and close resources during shutdown. Their dependency locks and build instructions are separate. See the [MIT License](LICENSE).
+Both expose authenticated REST and WebSocket APIs, reuse exchange connections, coalesce identical market-data requests, apply gateway rate limits, and close resources during shutdown. REST schemas are published at `/openapi.json` with Swagger UI at `/docs`; `/metrics` exposes authenticated Prometheus metrics and `/version` reports the running build. Their dependency locks and build instructions are separate. See the [MIT License](LICENSE).
 
 ## Start the Node.js version
 
@@ -36,6 +36,10 @@ Build and deploy the Node and Python folders as **two separate Northflank servic
 
 The detailed service settings and scale constraints are in [`deploy/northflank.md`](deploy/northflank.md). The project has one GitHub Actions workflow that tests both implementations, runs a public live-exchange check, and builds both containers.
 
+Set `DATABASE_URL` to a PostgreSQL-compatible database to enable durable market-history and order-audit storage. Successful REST requests to `/ohlcv` and `/trades` are archived; reads are available through `/v1/archive/ohlcv` and `/v1/archive/trades`. This is request-driven collection, not a backfill or continuous collector. Without a database, the gateway runs normally and archive reads return `503 storage_not_configured`. The SQL schema is in [`migrations/001_market_history.sql`](migrations/001_market_history.sql).
+
+Order submission is disabled by default. Set `TRADING_ENABLED=true` to enable limit orders; market orders also require `MARKET_ORDERS_ENABLED=true`. Every order request must include an `Idempotency-Key` header. Deduplication is process-local; use a single replica until idempotency is backed by a shared store. Keep exchange keys restricted to trading and read access, without withdrawal permission.
+
 ## API
 
 Both services provide the same route shape. Send `Authorization: Bearer <API_KEY>` on REST requests. WebSocket clients authenticate in their first JSON frame, so the key does not appear in the URL.
@@ -44,6 +48,9 @@ Both services provide the same route shape. Send `Authorization: Bearer <API_KEY
 | --- | --- | --- |
 | `GET` | `/health/live` | Liveness probe |
 | `GET` | `/health/ready` | Readiness probe |
+| `GET` | `/version` | Build version and commit identifier |
+| `GET` | `/metrics` | Prometheus metrics (Bearer token required) |
+| `GET` | `/openapi.json` | OpenAPI 3 document; `/docs` serves Swagger UI |
 | `GET` | `/v1/exchanges` | Supported CCXT exchange IDs |
 | `GET` | `/v1/{exchange}/capabilities` | Product types, timeframes, REST method status, and WebSocket channel status |
 | `GET` | `/v1/{exchange}/markets?type=spot&base=BTC&quote=USDT` | Filter exchange markets by product type and currencies (`spot`, `margin`, `swap`, `future`, `option`, `contract`) |
@@ -59,12 +66,20 @@ Both services provide the same route shape. Send `Authorization: Bearer <API_KEY
 | `GET` | `/v1/{exchange}/mark-price?symbol=BTC%2FUSDT%3AUSDT` | Current contract mark price |
 | `GET` | `/v1/{exchange}/mark-price-ohlcv?symbol=BTC%2FUSDT%3AUSDT&timeframe=1h&since=1700000000000` | Historical mark price candles |
 | `GET` | `/v1/{exchange}/balance` | Private balance; requires configured credentials |
-| `POST` | `/v1/{exchange}/order` | Submit a private order |
-| `DELETE` | `/v1/{exchange}/order/{id}?symbol=BTC%2FUSDT` | Cancel a private order |
+| `GET` | `/v1/{exchange}/open-orders?symbol=BTC%2FUSDT` | Private open orders |
+| `GET` | `/v1/{exchange}/order/{order_id}?symbol=BTC%2FUSDT` | Private order detail |
+| `GET` | `/v1/{exchange}/orders/history?symbol=BTC%2FUSDT&since=1700000000000&limit=100` | Private order history |
+| `GET` | `/v1/{exchange}/my-trades?symbol=BTC%2FUSDT&since=1700000000000&limit=100` | Private account trades |
+| `GET` | `/v1/{exchange}/positions?symbols=BTC%2FUSDT%3AUSDT` | Private contract positions |
+| `GET` | `/v1/{exchange}/trading-fee?symbol=BTC%2FUSDT` | Private trading fee |
+| `POST` | `/v1/{exchange}/order` | Submit a private order (requires `Idempotency-Key` and explicit trading enablement) |
+| `DELETE` | `/v1/{exchange}/order/{order_id}?symbol=BTC%2FUSDT` | Cancel a private order |
+| `GET` | `/v1/archive/ohlcv?exchange=binance&symbol=BTC%2FUSDT&timeframe=1h&since=1700000000000` | Read locally archived candles |
+| `GET` | `/v1/archive/trades?exchange=binance&symbol=BTC%2FUSDT&since=1700000000000` | Read locally archived trades |
 
 WebSocket clients connect to `/ws`, authenticate with `{"op":"auth","token":"<API_KEY>"}`, then subscribe with `{"op":"subscribe","id":"btc","exchange":"binance","channel":"ticker","symbol":"BTC/USDT"}`. Supported channels are `ticker`, `orderbook`, `trades`, `ohlcv`, `fundingRate`, and `markPrice`. Contract pairs use CCXT's unified contract symbol when required, such as `BTC/USDT:USDT`; discover available pairs with `/markets?type=swap` or `/markets?type=future`.
 
-Historical endpoints pass the requested timestamp and limit to the exchange. Add `paginate=true` to supported history routes to enable CCXT pagination, with `paginationCalls` capped at 5; CCXT documents this facility as experimental and exchange-dependent. The gateway does not archive upstream data, and exchanges set their own retention windows, page sizes, and supported market types. A unified symbol selects the exact market; availability of spot, margin, swap, dated futures, options, and each data method varies by exchange. Contract-only endpoints return a not-supported error when that exchange does not implement the underlying CCXT method.
+Historical endpoints pass the requested timestamp and limit to the exchange. Add `paginate=true` to supported history routes to enable CCXT pagination, with `paginationCalls` capped at 5; CCXT documents this facility as experimental and exchange-dependent. With `DATABASE_URL`, successful REST candle and trade responses are also archived locally, but exchange retention limits still apply until data has been collected. A unified symbol selects the exact market; availability of spot, margin, swap, dated futures, options, and each data method varies by exchange. Contract-only endpoints return a not-supported error when that exchange does not implement the underlying CCXT method.
 
 The capabilities response reports each method as `supported`, `emulated`, or `unsupported`, based on the installed CCXT exchange implementation. Use it before invoking optional methods such as batch tickers or contract metrics.
 
@@ -73,5 +88,6 @@ The capabilities response reports each method as `supported`, `emulated`, or `un
 - Each process caches a REST client and a Pro client per exchange. Requests and active streams hold leases; an idle timer closes both clients after the last lease is released.
 - Equivalent public REST requests share a bounded, short-lived cache entry. Private balances and orders are never cached.
 - REST and WebSocket commands use a bounded per-peer token bucket. WebSocket client and stream counts are capped.
+- `/metrics` reports request counts and latency histograms, exchange/storage errors, cache entries, active exchange instances, and shared streams. It requires the API bearer token.
 - WebSocket subscriptions are shared within each process. Keep each Northflank service at one replica unless a shared fan-out layer is added; replicas do not share their in-memory streams or rate-limit buckets.
 - Configure CCXT Pro according to its licensing terms. The live integration test only reads public market data and does not place orders.
