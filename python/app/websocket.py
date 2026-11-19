@@ -29,7 +29,14 @@ def _valid_subscription(message: dict[str, Any]) -> dict[str, Any]:
     sub_id = message.get("id")
     if not isinstance(exchange, str) or not exchange.isascii() or not exchange.isalnum():
         raise ValueError("exchange must be a CCXT exchange id")
-    if channel not in {"ticker", "orderbook", "trades", "ohlcv"}:
+    if channel not in {
+        "ticker",
+        "orderbook",
+        "trades",
+        "ohlcv",
+        "fundingRate",
+        "markPrice",
+    }:
         raise ValueError("unsupported channel")
     if not isinstance(symbol, str) or not 1 <= len(symbol) <= 64:
         raise ValueError("symbol must be 1-64 characters")

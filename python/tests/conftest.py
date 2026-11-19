@@ -15,20 +15,43 @@ class FakeExchange:
         self.has = {
             name: True
             for name in (
-                "load_markets",
-                "fetch_ticker",
-                "fetch_order_book",
-                "fetch_trades",
-                "fetch_ohlcv",
-                "fetch_balance",
-                "create_order",
-                "cancel_order",
+                "loadMarkets",
+                "fetchTicker",
+                "fetchOrderBook",
+                "fetchTrades",
+                "fetchOHLCV",
+                "fetchFundingRate",
+                "fetchFundingRateHistory",
+                "fetchOpenInterest",
+                "fetchOpenInterestHistory",
+                "fetchMarkPrice",
+                "fetchBalance",
+                "createOrder",
+                "cancelOrder",
+                "watchTicker",
+                "watchFundingRate",
+                "watchMarkPrice",
             )
         }
         metrics["instances"] += 1
 
     async def load_markets(self):
-        return {"BTC/USDT": {"symbol": "BTC/USDT"}}
+        return {
+            "BTC/USDT": {
+                "symbol": "BTC/USDT",
+                "type": "spot",
+                "base": "BTC",
+                "quote": "USDT",
+                "margin": True,
+            },
+            "BTC/USDT:USDT": {
+                "symbol": "BTC/USDT:USDT",
+                "type": "swap",
+                "base": "BTC",
+                "quote": "USDT",
+                "contract": True,
+            },
+        }
 
     async def fetch_ticker(self, symbol):
         self.metrics["ticker_calls"] += 1
@@ -37,12 +60,69 @@ class FakeExchange:
     async def fetch_order_book(self, symbol, limit=20):
         return {"symbol": symbol, "limit": limit, "bids": [], "asks": []}
 
-    async def fetch_trades(self, symbol, since=None, limit=None):
-        return [{"symbol": symbol, "since": since, "limit": limit}]
+    async def fetch_trades(self, symbol, since=None, limit=None, params=None):
+        params = params or {}
+        return [
+            {
+                "symbol": symbol,
+                "since": since,
+                "limit": limit,
+                "paginate": params.get("paginate", False),
+                "paginationCalls": params.get("paginationCalls"),
+                "paginationDirection": params.get("paginationDirection"),
+            }
+        ]
 
-    async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None):
-        return [[since or 0, 1, 2, 3, 4, 5, timeframe, limit]]
+    async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+        params = params or {}
+        return [
+            [
+                since or 0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                timeframe,
+                limit,
+                params.get("paginate", False),
+                params.get("price"),
+            ]
+        ]
 
+    async def fetch_funding_rate(self, symbol):
+        return {"symbol": symbol, "fundingRate": 0.0001}
+
+    async def fetch_funding_rate_history(self, symbol, since=None, limit=None, params=None):
+        params = params or {}
+        return [
+            {
+                "symbol": symbol,
+                "since": since,
+                "limit": limit,
+                "paginate": params.get("paginate", False),
+                "paginationCalls": params.get("paginationCalls"),
+            }
+        ]
+
+    async def fetch_open_interest(self, symbol):
+        return {"symbol": symbol, "openInterestAmount": 10}
+
+    async def fetch_open_interest_history(
+        self, symbol, timeframe="5m", since=None, limit=None, params=None
+    ):
+        return [
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "since": since,
+                "limit": limit,
+                "paginate": (params or {}).get("paginate", False),
+            }
+        ]
+
+    async def fetch_mark_price(self, symbol):
+        return {"symbol": symbol, "markPrice": 123.4}
     async def fetch_balance(self):
         self.metrics["balance_calls"] += 1
         return {"USDT": {"free": 10}}
@@ -76,6 +156,24 @@ class FakeExchange:
             self.metrics["watch_active"] -= 1
 
     async def un_watch_ticker(self, symbol):
+        return None
+
+    async def watch_funding_rate(self, symbol):
+        import asyncio
+
+        await asyncio.sleep(0.015)
+        return {"symbol": symbol, "fundingRate": 0.0001}
+
+    async def un_watch_funding_rate(self, symbol):
+        return None
+
+    async def watch_mark_price(self, symbol):
+        import asyncio
+
+        await asyncio.sleep(0.015)
+        return {"symbol": symbol, "markPrice": 123.4}
+
+    async def un_watch_mark_price(self, symbol):
         return None
 
     async def close(self):

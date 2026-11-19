@@ -61,6 +61,17 @@ test('WebSocket requires first-frame auth and shares live CCXT streams', async (
   assert.ok(data.subscriptionIds.includes('btc'));
   assert.ok(metrics.watchCalls >= 1);
 
+  const fundingSubscribed = nextMessage(socket, (message) => message.type === 'subscribed' && message.id === 'funding');
+  socket.send(JSON.stringify({
+    op: 'subscribe', id: 'funding', exchange: 'binance', channel: 'fundingRate', symbol: 'BTC/USDT:USDT',
+  }));
+  await fundingSubscribed;
+  const fundingUpdate = await nextMessage(socket, (message) => message.type === 'data' && message.channel === 'fundingRate');
+  assert.equal(fundingUpdate.data.fundingRate, 0.0001);
+  const fundingUnsubscribed = nextMessage(socket, (message) => message.type === 'unsubscribed' && message.id === 'funding');
+  socket.send(JSON.stringify({ op: 'unsubscribe', id: 'funding' }));
+  await fundingUnsubscribed;
+
   secondSocket = new WebSocket(url);
   await new Promise((resolve, reject) => {
     secondSocket.once('open', resolve);

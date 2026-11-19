@@ -8,10 +8,12 @@ from typing import Any
 from app.exchange_manager import ExchangeManager, ExchangeManagerError
 
 STREAMS = {
-    "ticker": ("watch_ticker", "un_watch_ticker"),
-    "orderbook": ("watch_order_book", "un_watch_order_book"),
-    "trades": ("watch_trades", "un_watch_trades"),
-    "ohlcv": ("watch_ohlcv", "un_watch_ohlcv"),
+    "ticker": ("watch_ticker", "un_watch_ticker", "watchTicker"),
+    "orderbook": ("watch_order_book", "un_watch_order_book", "watchOrderBook"),
+    "trades": ("watch_trades", "un_watch_trades", "watchTrades"),
+    "ohlcv": ("watch_ohlcv", "un_watch_ohlcv", "watchOHLCV"),
+    "fundingRate": ("watch_funding_rate", "un_watch_funding_rate", "watchFundingRate"),
+    "markPrice": ("watch_mark_price", "un_watch_mark_price", "watchMarkPrice"),
 }
 
 
@@ -33,6 +35,8 @@ def _arguments(stream: Stream) -> tuple[Any, ...]:
         return (stream.symbol, stream.limit)
     if stream.channel == "trades":
         return (stream.symbol, None, stream.limit)
+    if stream.channel in {"fundingRate", "markPrice"}:
+        return (stream.symbol,)
     return (stream.symbol, stream.timeframe, None, stream.limit)
 
 
@@ -145,8 +149,20 @@ class MarketStreamHub:
         lease = None
         try:
             lease = await self.manager.acquire(options["exchange"], "pro")
-            method = STREAMS[options["channel"]][0]
-            if not callable(getattr(lease.exchange, method, None)):
+            if options["channel"] in {"fundingRate", "markPrice"}:
+                markets = await lease.exchange.load_markets()
+                market = markets.get(options["symbol"])
+                if not market or market.get("type") not in {"swap", "future"}:
+                    raise ExchangeManagerError(
+                        "The symbol is not an available swap or future market",
+                        400,
+                        "invalid_market_type",
+                    )
+            method, _, capability = STREAMS[options["channel"]]
+            if (
+                not callable(getattr(lease.exchange, method, None))
+                or getattr(lease.exchange, "has", {}).get(capability) is not True
+            ):
                 raise ExchangeManagerError(
                     f"Exchange does not support {method}", 501, "method_not_supported"
                 )

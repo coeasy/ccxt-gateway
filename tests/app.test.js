@@ -41,6 +41,61 @@ test('REST requests share a cached exchange instance and validate request input'
   assert.equal(invalid.statusCode, 400);
 });
 
+test('market filters, historical query parameters, and contract metrics reach CCXT', async (t) => {
+  const { ccxt } = createFakeCcxt();
+  const app = buildApp({ config: testConfig(), ccxt, logger: false }).fastify;
+  t.after(() => app.close());
+
+  const markets = await app.inject({
+    method: 'GET', url: '/v1/binance/markets?type=swap&base=btc&quote=usdt', headers: authorization,
+  });
+  const contracts = await app.inject({
+    method: 'GET', url: '/v1/binance/markets?type=contract', headers: authorization,
+  });
+  const marginMarkets = await app.inject({
+    method: 'GET', url: '/v1/binance/markets?type=margin', headers: authorization,
+  });
+  const trades = await app.inject({
+    method: 'GET', url: '/v1/binance/trades?symbol=BTC%2FUSDT%3AUSDT&since=1700000000000&limit=50&paginate=true&paginationCalls=3', headers: authorization,
+  });
+  const funding = await app.inject({
+    method: 'GET', url: '/v1/binance/funding-rate-history?symbol=BTC%2FUSDT%3AUSDT&since=1700000000000&limit=20&paginate=true&paginationCalls=3', headers: authorization,
+  });
+  const spotFunding = await app.inject({
+    method: 'GET', url: '/v1/binance/funding-rate?symbol=BTC%2FUSDT', headers: authorization,
+  });
+  const interest = await app.inject({
+    method: 'GET', url: '/v1/binance/open-interest-history?symbol=BTC%2FUSDT%3AUSDT&timeframe=1h&since=1700000000000', headers: authorization,
+  });
+  const markPrice = await app.inject({
+    method: 'GET', url: '/v1/binance/mark-price?symbol=BTC%2FUSDT%3AUSDT', headers: authorization,
+  });
+  const markCandles = await app.inject({
+    method: 'GET', url: '/v1/binance/mark-price-ohlcv?symbol=BTC%2FUSDT%3AUSDT&timeframe=1h&since=1700000000000&paginate=true&paginationCalls=2', headers: authorization,
+  });
+  const indexCandles = await app.inject({
+    method: 'GET', url: '/v1/binance/ohlcv?symbol=BTC%2FUSDT%3AUSDT&timeframe=1h&price=index', headers: authorization,
+  });
+
+  assert.deepEqual(Object.keys(markets.json().markets), ['BTC/USDT:USDT']);
+  assert.deepEqual(Object.keys(contracts.json().markets), ['BTC/USDT:USDT']);
+  assert.deepEqual(Object.keys(marginMarkets.json().markets), ['BTC/USDT']);
+  assert.equal(trades.json().trades[0].since, 1700000000000);
+  assert.equal(trades.json().trades[0].paginate, true);
+  assert.equal(trades.json().trades[0].paginationCalls, 3);
+  assert.equal(trades.json().trades[0].paginationDirection, 'forward');
+  assert.equal(funding.json().fundingRates[0].limit, 20);
+  assert.equal(funding.json().fundingRates[0].paginationCalls, 3);
+  assert.equal(spotFunding.statusCode, 400);
+  assert.equal(spotFunding.json().error, 'invalid_market_type');
+  assert.equal(interest.json().history[0].timeframe, '1h');
+  assert.equal(markPrice.json().markPrice.markPrice, 123.4);
+  assert.equal(markCandles.json().candles[0][4], true);
+  assert.equal(markCandles.json().candles[0][5], 'mark');
+  assert.equal(indexCandles.json().price, 'index');
+  assert.equal(indexCandles.json().candles[0][5], 'index');
+});
+
 test('gateway token bucket returns 429 with a retry window after the configured capacity', async (t) => {
   const { ccxt } = createFakeCcxt();
   const app = buildApp({ config: testConfig({ rateLimitRequests: 1 }), ccxt, logger: false }).fastify;

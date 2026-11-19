@@ -10,7 +10,43 @@ import { registerWebSocket } from './websocket.js';
 const EXCHANGE_PARAM = { type: 'object', required: ['exchange'], properties: { exchange: { type: 'string', pattern: '^[a-z0-9]+$' } } };
 const SYMBOL_QUERY = { type: 'object', required: ['symbol'], additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 } } };
 const LIMIT_QUERY = { type: 'object', required: ['symbol'], additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 }, limit: { type: 'integer', minimum: 1, maximum: 1000 } } };
-const OHLCV_QUERY = { type: 'object', required: ['symbol', 'timeframe'], additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 }, timeframe: { type: 'string', minLength: 1, maxLength: 16 }, since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000 } } };
+const PAGINATION_PROPERTIES = {
+  paginate: { type: 'boolean', default: false },
+  paginationCalls: { type: 'integer', minimum: 1, maximum: 5, default: 5 },
+};
+const TRADES_QUERY = { type: 'object', required: ['symbol'], additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 }, since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000 }, ...PAGINATION_PROPERTIES } };
+const OHLCV_QUERY = { type: 'object', required: ['symbol', 'timeframe'], additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 }, timeframe: { type: 'string', minLength: 1, maxLength: 16 }, since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000 }, price: { type: 'string', enum: ['mark', 'index', 'premiumIndex'] }, ...PAGINATION_PROPERTIES } };
+const MARK_PRICE_OHLCV_QUERY = {
+  ...OHLCV_QUERY,
+  properties: Object.fromEntries(Object.entries(OHLCV_QUERY.properties).filter(([key]) => key !== 'price')),
+};
+const FUNDING_HISTORY_QUERY = { type: 'object', required: ['symbol'], additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 }, since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000 }, ...PAGINATION_PROPERTIES } };
+const OPEN_INTEREST_HISTORY_QUERY = { type: 'object', required: ['symbol'], additionalProperties: false, properties: { symbol: { type: 'string', minLength: 1, maxLength: 64 }, timeframe: { type: 'string', minLength: 1, maxLength: 16 }, since: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 1000 }, ...PAGINATION_PROPERTIES } };
+const MARKET_TYPE = { type: 'string', enum: ['spot', 'margin', 'swap', 'future', 'option', 'contract'] };
+
+function paginationParams(query, { forwardSince = false } = {}) {
+  if (!query.paginate) return {};
+  return {
+    paginate: true,
+    paginationCalls: query.paginationCalls ?? 5,
+    ...(forwardSince && query.since !== undefined ? { paginationDirection: 'forward' } : {}),
+  };
+}
+
+function selectMarkets(markets, { type, base, quote }) {
+  const matchesType = (market) => {
+    if (!market || typeof market !== 'object') return false;
+    if (!type) return true;
+    if (type === 'margin') return market.margin === true;
+    if (type === 'contract') return market.contract === true || ['swap', 'future', 'option'].includes(market.type);
+    return market.type === type;
+  };
+  return Object.fromEntries(Object.entries(markets).filter(([, market]) => (
+    matchesType(market)
+    && (!base || market.base?.toUpperCase() === base.toUpperCase())
+    && (!quote || market.quote?.toUpperCase() === quote.toUpperCase())
+  )));
+}
 
 function routeError(error, reply, request, fastify) {
   if (error instanceof ExchangeManagerError) {
@@ -21,15 +57,23 @@ function routeError(error, reply, request, fastify) {
   return reply.code(502).send({ error: 'exchange_request_failed', message: 'The exchange request failed' });
 }
 
-async function callExchange(exchangeManager, exchangeId, method, args, { cache, ttlMs } = {}) {
+async function callExchange(exchangeManager, exchangeId, method, args, { cache, ttlMs, marketType } = {}) {
   const execute = () => exchangeManager.withExchange(exchangeId, async (exchange) => {
-    if (typeof exchange[method] !== 'function' || exchange.has?.[method] === false) {
+    if (marketType === 'contract') {
+      const markets = await exchange.loadMarkets();
+      const market = markets?.[args[0]];
+      if (!market || !['swap', 'future'].includes(market.type)) {
+        throw new ExchangeManagerError('The symbol is not an available swap or future market', 400, 'invalid_market_type');
+      }
+    }
+    const capability = exchange.has?.[method];
+    if (typeof exchange[method] !== 'function' || (capability !== true && capability !== 'emulated')) {
       throw new ExchangeManagerError(`Exchange "${exchangeId}" does not support ${method}`, 501, 'method_not_supported');
     }
     return exchange[method](...args);
   });
   if (!cache || !ttlMs) return execute();
-  return cache.getOrCreate(JSON.stringify([exchangeId, method, args]), ttlMs, execute);
+  return cache.getOrCreate(JSON.stringify([exchangeId, method, args, marketType ?? null]), ttlMs, execute);
 }
 
 export function buildApp({ config, ccxt, logger = true } = {}) {
@@ -95,10 +139,26 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
 
   fastify.get('/v1/exchanges', async () => ({ exchanges: exchangeManager.listExchanges() }));
 
-  fastify.get('/v1/:exchange/markets', { schema: { params: EXCHANGE_PARAM } }, async (request, reply) => {
+  fastify.get('/v1/:exchange/markets', {
+    schema: {
+      params: EXCHANGE_PARAM,
+      querystring: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          type: MARKET_TYPE,
+          base: { type: 'string', minLength: 1, maxLength: 16 },
+          quote: { type: 'string', minLength: 1, maxLength: 16 },
+        },
+      },
+    },
+  }, async (request, reply) => {
     try {
       const markets = await callExchange(exchangeManager, request.params.exchange, 'loadMarkets', [], { cache, ttlMs: config.cacheMarketsTtlMs });
-      return { exchange: request.params.exchange, markets };
+      return {
+        exchange: request.params.exchange,
+        filters: { type: request.query.type ?? null, base: request.query.base ?? null, quote: request.query.quote ?? null },
+        markets: selectMarkets(markets, request.query),
+      };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
@@ -116,17 +176,59 @@ export function buildApp({ config, ccxt, logger = true } = {}) {
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
-  fastify.get('/v1/:exchange/trades', { schema: { params: EXCHANGE_PARAM, querystring: LIMIT_QUERY } }, async (request, reply) => {
+  fastify.get('/v1/:exchange/trades', { schema: { params: EXCHANGE_PARAM, querystring: TRADES_QUERY } }, async (request, reply) => {
     try {
-      const trades = await callExchange(exchangeManager, request.params.exchange, 'fetchTrades', [request.query.symbol, undefined, request.query.limit], { cache, ttlMs: config.cacheTradesTtlMs });
+      const trades = await callExchange(exchangeManager, request.params.exchange, 'fetchTrades', [request.query.symbol, request.query.since, request.query.limit, paginationParams(request.query, { forwardSince: true })], { cache, ttlMs: config.cacheTradesTtlMs });
       return { exchange: request.params.exchange, symbol: request.query.symbol, trades };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 
   fastify.get('/v1/:exchange/ohlcv', { schema: { params: EXCHANGE_PARAM, querystring: OHLCV_QUERY } }, async (request, reply) => {
     try {
-      const candles = await callExchange(exchangeManager, request.params.exchange, 'fetchOHLCV', [request.query.symbol, request.query.timeframe, request.query.since, request.query.limit], { cache, ttlMs: config.cacheOhlcvTtlMs });
-      return { exchange: request.params.exchange, symbol: request.query.symbol, timeframe: request.query.timeframe, candles };
+      const candles = await callExchange(exchangeManager, request.params.exchange, 'fetchOHLCV', [request.query.symbol, request.query.timeframe, request.query.since, request.query.limit, { ...(request.query.price ? { price: request.query.price } : {}), ...paginationParams(request.query) }], { cache, ttlMs: config.cacheOhlcvTtlMs, marketType: request.query.price ? 'contract' : undefined });
+      return { exchange: request.params.exchange, symbol: request.query.symbol, timeframe: request.query.timeframe, price: request.query.price ?? 'last', candles };
+    } catch (error) { return routeError(error, reply, request, fastify); }
+  });
+
+  fastify.get('/v1/:exchange/funding-rate', { schema: { params: EXCHANGE_PARAM, querystring: SYMBOL_QUERY } }, async (request, reply) => {
+    try {
+      const fundingRate = await callExchange(exchangeManager, request.params.exchange, 'fetchFundingRate', [request.query.symbol], { cache, ttlMs: config.cacheTickerTtlMs, marketType: 'contract' });
+      return { exchange: request.params.exchange, symbol: request.query.symbol, fundingRate };
+    } catch (error) { return routeError(error, reply, request, fastify); }
+  });
+
+  fastify.get('/v1/:exchange/funding-rate-history', { schema: { params: EXCHANGE_PARAM, querystring: FUNDING_HISTORY_QUERY } }, async (request, reply) => {
+    try {
+      const fundingRates = await callExchange(exchangeManager, request.params.exchange, 'fetchFundingRateHistory', [request.query.symbol, request.query.since, request.query.limit, paginationParams(request.query)], { marketType: 'contract' });
+      return { exchange: request.params.exchange, symbol: request.query.symbol, fundingRates };
+    } catch (error) { return routeError(error, reply, request, fastify); }
+  });
+
+  fastify.get('/v1/:exchange/open-interest', { schema: { params: EXCHANGE_PARAM, querystring: SYMBOL_QUERY } }, async (request, reply) => {
+    try {
+      const openInterest = await callExchange(exchangeManager, request.params.exchange, 'fetchOpenInterest', [request.query.symbol], { cache, ttlMs: config.cacheTickerTtlMs, marketType: 'contract' });
+      return { exchange: request.params.exchange, symbol: request.query.symbol, openInterest };
+    } catch (error) { return routeError(error, reply, request, fastify); }
+  });
+
+  fastify.get('/v1/:exchange/open-interest-history', { schema: { params: EXCHANGE_PARAM, querystring: OPEN_INTEREST_HISTORY_QUERY } }, async (request, reply) => {
+    try {
+      const history = await callExchange(exchangeManager, request.params.exchange, 'fetchOpenInterestHistory', [request.query.symbol, request.query.timeframe ?? '5m', request.query.since, request.query.limit, paginationParams(request.query)], { marketType: 'contract' });
+      return { exchange: request.params.exchange, symbol: request.query.symbol, timeframe: request.query.timeframe ?? '5m', history };
+    } catch (error) { return routeError(error, reply, request, fastify); }
+  });
+
+  fastify.get('/v1/:exchange/mark-price', { schema: { params: EXCHANGE_PARAM, querystring: SYMBOL_QUERY } }, async (request, reply) => {
+    try {
+      const markPrice = await callExchange(exchangeManager, request.params.exchange, 'fetchMarkPrice', [request.query.symbol], { cache, ttlMs: config.cacheTickerTtlMs, marketType: 'contract' });
+      return { exchange: request.params.exchange, symbol: request.query.symbol, markPrice };
+    } catch (error) { return routeError(error, reply, request, fastify); }
+  });
+
+  fastify.get('/v1/:exchange/mark-price-ohlcv', { schema: { params: EXCHANGE_PARAM, querystring: MARK_PRICE_OHLCV_QUERY } }, async (request, reply) => {
+    try {
+      const candles = await callExchange(exchangeManager, request.params.exchange, 'fetchOHLCV', [request.query.symbol, request.query.timeframe, request.query.since, request.query.limit, { price: 'mark', ...paginationParams(request.query) }], { marketType: 'contract' });
+      return { exchange: request.params.exchange, symbol: request.query.symbol, timeframe: request.query.timeframe, price: 'mark', candles };
     } catch (error) { return routeError(error, reply, request, fastify); }
   });
 

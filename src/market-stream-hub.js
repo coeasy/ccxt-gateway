@@ -1,3 +1,5 @@
+import { ExchangeManagerError } from './exchange-manager.js';
+
 const STOPPED = Symbol('stream-stopped');
 
 const STREAMS = Object.freeze({
@@ -5,6 +7,8 @@ const STREAMS = Object.freeze({
   orderbook: { method: 'watchOrderBook', unwatch: 'unWatchOrderBook' },
   trades: { method: 'watchTrades', unwatch: 'unWatchTrades' },
   ohlcv: { method: 'watchOHLCV', unwatch: 'unWatchOHLCV' },
+  fundingRate: { method: 'watchFundingRate', unwatch: 'unWatchFundingRate' },
+  markPrice: { method: 'watchMarkPrice', unwatch: 'unWatchMarkPrice' },
 });
 
 function sleep(ms) {
@@ -22,6 +26,8 @@ function watchArguments(stream) {
     case 'orderbook': return [stream.symbol, stream.limit];
     case 'trades': return [stream.symbol, undefined, stream.limit];
     case 'ohlcv': return [stream.symbol, stream.timeframe, undefined, stream.limit];
+    case 'fundingRate':
+    case 'markPrice': return [stream.symbol];
     default: return [];
   }
 }
@@ -107,8 +113,27 @@ export class MarketStreamHub {
       lease.release();
       throw new Error('Stream hub is shutting down');
     }
+    if (options.channel === 'fundingRate' || options.channel === 'markPrice') {
+      try {
+        const markets = await lease.exchange.loadMarkets();
+        const market = markets?.[options.symbol];
+        if (!market || !['swap', 'future'].includes(market.type)) {
+          throw new ExchangeManagerError(
+            'The symbol is not an available swap or future market',
+            400,
+            'invalid_market_type',
+          );
+        }
+      } catch (error) {
+        lease.release();
+        throw error;
+      }
+    }
     const definition = STREAMS[options.channel];
-    if (typeof lease.exchange[definition.method] !== 'function') {
+    if (
+      typeof lease.exchange[definition.method] !== 'function'
+      || lease.exchange.has?.[definition.method] !== true
+    ) {
       lease.release();
       throw new Error(`Exchange "${options.exchange}" does not support ${definition.method}`);
     }

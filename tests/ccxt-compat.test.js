@@ -10,5 +10,16 @@ test('installed CCXT exposes the REST and Pro constructors used by the gateway',
   const exchange = new ccxt.pro.binance({ enableRateLimit: true });
   assert.equal(typeof exchange.fetchTicker, 'function');
   assert.equal(typeof exchange.watchTicker, 'function');
+  for (const method of [
+    'fetchFundingRate',
+    'fetchFundingRateHistory',
+    'fetchOpenInterest',
+    'fetchOpenInterestHistory',
+    'fetchMarkPrice',
+    'watchFundingRate',
+    'watchMarkPrice',
+  ]) {
+    assert.equal(typeof exchange[method], 'function', `Expected CCXT Pro method ${method}`);
+  }
   await exchange.close();
 });

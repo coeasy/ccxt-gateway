@@ -1,6 +1,6 @@
 import { secureTokenEquals } from './auth.js';
 
-const CHANNELS = new Set(['ticker', 'orderbook', 'trades', 'ohlcv']);
+const CHANNELS = new Set(['ticker', 'orderbook', 'trades', 'ohlcv', 'fundingRate', 'markPrice']);
 const MAX_SUBSCRIPTIONS_PER_CLIENT = 50;
 const MAX_QUEUED_MESSAGES = 100;
 const AUTH_TIMEOUT_MS = 5_000;
@@ -152,7 +152,12 @@ export function registerWebSocket(fastify, { hub, apiKey, maxClients = 500, limi
         subscriptions.set(message.id, unsubscribe);
         send(socket, { type: 'subscribed', id: message.id, exchange: message.exchange, channel: message.channel, symbol: message.symbol });
       } catch (error) {
-        send(socket, { type: 'error', id: message.id, error: 'subscription_failed', message: 'The requested stream is unavailable' });
+        send(socket, {
+          type: 'error',
+          id: message.id,
+          error: typeof error?.code === 'string' ? error.code : 'subscription_failed',
+          message: 'The requested stream is unavailable',
+        });
       }
     }
   });

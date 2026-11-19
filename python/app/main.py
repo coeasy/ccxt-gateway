@@ -18,6 +18,59 @@ from app.rate_limit import TokenBucketLimiter
 from app.websocket import serve_websocket
 
 logger = logging.getLogger("ccxt_gateway")
+CAPABILITIES = {
+    "load_markets": "loadMarkets",
+    "fetch_ticker": "fetchTicker",
+    "fetch_order_book": "fetchOrderBook",
+    "fetch_trades": "fetchTrades",
+    "fetch_ohlcv": "fetchOHLCV",
+    "fetch_funding_rate": "fetchFundingRate",
+    "fetch_funding_rate_history": "fetchFundingRateHistory",
+    "fetch_open_interest": "fetchOpenInterest",
+    "fetch_open_interest_history": "fetchOpenInterestHistory",
+    "fetch_mark_price": "fetchMarkPrice",
+    "fetch_balance": "fetchBalance",
+    "create_order": "createOrder",
+    "cancel_order": "cancelOrder",
+}
+
+
+def _filter_markets(
+    markets: dict[str, Any], market_type: str | None, base: str | None, quote: str | None
+) -> dict[str, Any]:
+    return {
+        symbol: market
+        for symbol, market in markets.items()
+        if isinstance(market, dict)
+        and (
+            market_type is None
+            or (market_type == "margin" and market.get("margin") is True)
+            or (
+                market_type == "contract"
+                and (
+                    market.get("contract") is True
+                    or market.get("type") in {"swap", "future", "option"}
+                )
+            )
+            or (market_type not in {"margin", "contract"} and market.get("type") == market_type)
+        )
+        and (base is None or str(market.get("base", "")).upper() == base.upper())
+        and (quote is None or str(market.get("quote", "")).upper() == quote.upper())
+    }
+
+
+def _pagination_params(
+    paginate: bool,
+    pagination_calls: int,
+    since: int | None = None,
+    forward_since: bool = False,
+) -> dict[str, Any]:
+    if not paginate:
+        return {}
+    params: dict[str, Any] = {"paginate": True, "paginationCalls": pagination_calls}
+    if forward_since and since is not None:
+        params["paginationDirection"] = "forward"
+    return params
 
 
 class OrderRequest(BaseModel):
@@ -111,11 +164,28 @@ def create_app(
     router = APIRouter(prefix="/v1", dependencies=[Depends(authenticate)])
 
     async def call_exchange(
-        exchange_id: str, method: str, args: tuple[Any, ...], ttl: float | None = None
+        exchange_id: str,
+        method: str,
+        args: tuple[Any, ...],
+        ttl: float | None = None,
+        market_type: str | None = None,
     ) -> Any:
         async def operation(exchange: Any) -> Any:
+            if market_type == "contract":
+                markets = await exchange.load_markets()
+                market = markets.get(args[0])
+                if not market or market.get("type") not in {"swap", "future"}:
+                    raise ExchangeManagerError(
+                        "The symbol is not an available swap or future market",
+                        400,
+                        "invalid_market_type",
+                    )
             capability = getattr(exchange, "has", {})
-            if capability.get(method) is False or not callable(getattr(exchange, method, None)):
+            supported = capability.get(CAPABILITIES.get(method, method))
+            if (
+                not (supported is True or supported == "emulated")
+                or not callable(getattr(exchange, method, None))
+            ):
                 raise ExchangeManagerError(
                     f"Exchange does not support {method}", 501, "method_not_supported"
                 )
@@ -123,7 +193,9 @@ def create_app(
 
         if ttl is None:
             return await exchange_manager.with_exchange(exchange_id, operation)
-        key = json.dumps([exchange_id, method, args], separators=(",", ":"), sort_keys=True)
+        key = json.dumps(
+            [exchange_id, method, args, market_type], separators=(",", ":"), sort_keys=True
+        )
         return await cache.get_or_create(
             key, ttl, lambda: exchange_manager.with_exchange(exchange_id, operation)
         )
@@ -133,13 +205,22 @@ def create_app(
         return {"exchanges": exchange_manager.list_exchanges()}
 
     @router.get("/{exchange}/markets")
-    async def markets(exchange: str) -> dict[str, Any]:
+    async def markets(
+        exchange: str,
+        market_type: str | None = Query(
+            default=None, alias="type", pattern="^(spot|margin|swap|future|option|contract)$"
+        ),
+        base: str | None = Query(default=None, min_length=1, max_length=16),
+        quote: str | None = Query(default=None, min_length=1, max_length=16),
+    ) -> dict[str, Any]:
         try:
+            loaded = await call_exchange(
+                exchange, "load_markets", (), config.cache_markets_ttl
+            )
             return {
                 "exchange": exchange,
-                "markets": await call_exchange(
-                    exchange, "load_markets", (), config.cache_markets_ttl
-                ),
+                "filters": {"type": market_type, "base": base, "quote": quote},
+                "markets": _filter_markets(loaded, market_type, base, quote),
             }
         except ExchangeManagerError:
             raise
@@ -183,11 +264,22 @@ def create_app(
     async def trades(
         exchange: str,
         symbol: str = Query(min_length=1, max_length=64),
+        since: int | None = Query(default=None, ge=0),
         limit: int = Query(default=100, ge=1, le=1000),
+        paginate: bool = Query(default=False),
+        pagination_calls: int = Query(default=5, alias="paginationCalls", ge=1, le=5),
     ) -> dict[str, Any]:
         try:
             value = await call_exchange(
-                exchange, "fetch_trades", (symbol, None, limit), config.cache_trades_ttl
+                exchange,
+                "fetch_trades",
+                (
+                    symbol,
+                    since,
+                    limit,
+                    _pagination_params(paginate, pagination_calls, since, forward_since=True),
+                ),
+                config.cache_trades_ttl,
             )
             return {"exchange": exchange, "symbol": symbol, "trades": value}
         except ExchangeManagerError:
@@ -202,15 +294,181 @@ def create_app(
         timeframe: str = Query(min_length=1, max_length=16),
         since: int | None = Query(default=None, ge=0),
         limit: int = Query(default=100, ge=1, le=1000),
+        price: str | None = Query(default=None, pattern="^(mark|index|premiumIndex)$"),
+        paginate: bool = Query(default=False),
+        pagination_calls: int = Query(default=5, alias="paginationCalls", ge=1, le=5),
     ) -> dict[str, Any]:
         try:
             value = await call_exchange(
-                exchange, "fetch_ohlcv", (symbol, timeframe, since, limit), config.cache_ohlcv_ttl
+                exchange,
+                "fetch_ohlcv",
+                (
+                    symbol,
+                    timeframe,
+                    since,
+                    limit,
+                    {
+                        **({"price": price} if price else {}),
+                        **_pagination_params(paginate, pagination_calls, since),
+                    },
+                ),
+                config.cache_ohlcv_ttl,
+                market_type="contract" if price else None,
             )
             return {
                 "exchange": exchange,
                 "symbol": symbol,
                 "timeframe": timeframe,
+                "price": price or "last",
+                "candles": value,
+            }
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/funding-rate")
+    async def funding_rate(
+        exchange: str, symbol: str = Query(min_length=1, max_length=64)
+    ) -> dict[str, Any]:
+        try:
+            value = await call_exchange(
+                exchange,
+                "fetch_funding_rate",
+                (symbol,),
+                config.cache_ticker_ttl,
+                market_type="contract",
+            )
+            return {"exchange": exchange, "symbol": symbol, "fundingRate": value}
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/funding-rate-history")
+    async def funding_rate_history(
+        exchange: str,
+        symbol: str = Query(min_length=1, max_length=64),
+        since: int | None = Query(default=None, ge=0),
+        limit: int | None = Query(default=None, ge=1, le=1000),
+        paginate: bool = Query(default=False),
+        pagination_calls: int = Query(default=5, alias="paginationCalls", ge=1, le=5),
+    ) -> dict[str, Any]:
+        try:
+            value = await call_exchange(
+                exchange,
+                "fetch_funding_rate_history",
+                (symbol, since, limit, _pagination_params(paginate, pagination_calls, since)),
+                market_type="contract",
+            )
+            return {"exchange": exchange, "symbol": symbol, "fundingRates": value}
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/open-interest")
+    async def open_interest(
+        exchange: str, symbol: str = Query(min_length=1, max_length=64)
+    ) -> dict[str, Any]:
+        try:
+            value = await call_exchange(
+                exchange,
+                "fetch_open_interest",
+                (symbol,),
+                config.cache_ticker_ttl,
+                market_type="contract",
+            )
+            return {"exchange": exchange, "symbol": symbol, "openInterest": value}
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/open-interest-history")
+    async def open_interest_history(
+        exchange: str,
+        symbol: str = Query(min_length=1, max_length=64),
+        timeframe: str = Query(default="5m", min_length=1, max_length=16),
+        since: int | None = Query(default=None, ge=0),
+        limit: int | None = Query(default=None, ge=1, le=1000),
+        paginate: bool = Query(default=False),
+        pagination_calls: int = Query(default=5, alias="paginationCalls", ge=1, le=5),
+    ) -> dict[str, Any]:
+        try:
+            value = await call_exchange(
+                exchange,
+                "fetch_open_interest_history",
+                (
+                    symbol,
+                    timeframe,
+                    since,
+                    limit,
+                    _pagination_params(paginate, pagination_calls, since),
+                ),
+                market_type="contract",
+            )
+            return {
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "history": value,
+            }
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/mark-price")
+    async def mark_price(
+        exchange: str, symbol: str = Query(min_length=1, max_length=64)
+    ) -> dict[str, Any]:
+        try:
+            value = await call_exchange(
+                exchange,
+                "fetch_mark_price",
+                (symbol,),
+                config.cache_ticker_ttl,
+                market_type="contract",
+            )
+            return {"exchange": exchange, "symbol": symbol, "markPrice": value}
+        except ExchangeManagerError:
+            raise
+        except Exception as exc:
+            _raise_exchange_error(exchange, exc)
+
+    @router.get("/{exchange}/mark-price-ohlcv")
+    async def mark_price_ohlcv(
+        exchange: str,
+        symbol: str = Query(min_length=1, max_length=64),
+        timeframe: str = Query(min_length=1, max_length=16),
+        since: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+        price: str = Query(default="mark", pattern="^mark$"),
+        paginate: bool = Query(default=False),
+        pagination_calls: int = Query(default=5, alias="paginationCalls", ge=1, le=5),
+    ) -> dict[str, Any]:
+        try:
+            value = await call_exchange(
+                exchange,
+                "fetch_ohlcv",
+                (
+                    symbol,
+                    timeframe,
+                    since,
+                    limit,
+                    {
+                        "price": "mark",
+                        **_pagination_params(paginate, pagination_calls, since),
+                    },
+                ),
+                market_type="contract",
+            )
+            return {
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "price": price,
                 "candles": value,
             }
         except ExchangeManagerError:
